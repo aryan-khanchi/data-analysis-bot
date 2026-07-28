@@ -1,0 +1,18 @@
+[project]
+name = "tds-telegram-bot"
+version = "0.1.0"
+description = "Data analyst Telegram bot - an LLM agent that answers data questions with JSON"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",
+    "requests>=2.31",
+    "flask>=3.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "openpyxl>=3.1",
+    "pdfplumber>=0.11",
+    "ddgs>=6.0",
+    "python-dotenv>=1.0",
+]

@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tds-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        sync: false
+      - key: MODEL
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
