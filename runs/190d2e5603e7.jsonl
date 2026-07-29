@@ -1,0 +1,8 @@
+{"ts": 1785332197.7605555, "run_id": "190d2e5603e7", "event": "delivery", "telegram_sent_at": 1785332197, "seconds_before_bot_saw_it": 0.76}
+{"ts": 1785332197.760673, "run_id": "190d2e5603e7", "event": "question", "text": "What is 18/9?"}
+{"ts": 1785332205.4266062, "run_id": "190d2e5603e7", "event": "model_turn", "step": 0, "seconds": 7.67, "prompt_tokens": 745, "completion_tokens": 24, "reasoning": "", "tool_calls": ["run_python"]}
+{"ts": 1785332205.4267714, "run_id": "190d2e5603e7", "event": "tool_call", "step": 0, "tool": "run_python", "args": {"code": "print(18 / 9)\n"}}
+{"ts": 1785332205.6012504, "run_id": "190d2e5603e7", "event": "tool_result", "step": 0, "tool": "run_python", "seconds": 0.17, "chars": 3, "result": "2.0"}
+{"ts": 1785332206.8533132, "run_id": "190d2e5603e7", "event": "model_turn", "step": 1, "seconds": 1.25, "prompt_tokens": 785, "completion_tokens": 23, "reasoning": "", "tool_calls": ["submit_answer"]}
+{"ts": 1785332206.8536527, "run_id": "190d2e5603e7", "event": "submit_answer", "raw": "{\"result\": 2}", "parsed": {"result": 2}}
+{"ts": 1785332206.8537467, "run_id": "190d2e5603e7", "event": "agent_done", "agent_seconds": 9.09}
