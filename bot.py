@@ -273,6 +273,12 @@ def _cached_download(url: str):
     return path, False
 
 
+# Page counts of PDFs we've downloaded, so tool_run_python can cheaply tell
+# whether a snippet is about to loop over a huge document. Filled by download_file.
+PDF_PAGE_COUNTS: dict[str, int] = {}
+LARGE_PDF_PAGES = int(os.environ.get("LARGE_PDF_PAGES", 50))
+
+
 def tool_download_file(url: str) -> str:
     """Download once, keep it on disk, and report what's inside. Safe to call
     again with the SAME url later - it's free, since the file is already on disk."""
@@ -284,7 +290,14 @@ def tool_download_file(url: str) -> str:
         if path.suffix == ".pdf":
             try:
                 from pypdf import PdfReader
-                info.append(f"PDF with {len(PdfReader(str(path)).pages)} pages")
+                n = len(PdfReader(str(path)).pages)
+                PDF_PAGE_COUNTS[str(path)] = n
+                info.append(f"PDF with {n} pages")
+                if n > LARGE_PDF_PAGES:
+                    info.append(f"This is a LARGE PDF. Do NOT loop over its pages in "
+                                f"run_python - that times out and returns nothing. Use "
+                                f"find_pdf_pages to locate the table, then fetch_url for "
+                                f"that narrow page range.")
             except Exception:
                 pass
         info.append("This file stays on disk. In run_python, open it by PATH - "
@@ -495,8 +508,43 @@ def tool_find_pdf_pages(url: str, keyword: str) -> str:
     return _run_child(script, timeout=budget + 30)
 
 
+# Matches a loop over EVERY page of a PDF: `for p in reader.pages`,
+# `for i, p in enumerate(reader.pages)`, `range(len(reader.pages))`,
+# `range(doc.page_count)`. A bounded slice like `reader.pages[60:75]` won't match,
+# so reading a known range is still allowed.
+_FULL_PAGE_LOOP = re.compile(
+    r"(?:for\s+[\w,\s]+\s+in\s+(?:enumerate\s*\()?\s*[\w\.]*\.pages\b(?!\s*\[)"
+    r"|range\s*\(\s*len\s*\(\s*[\w\.]*\.pages\b(?!\s*\[)"
+    r"|range\s*\(\s*[\w\.]*\.page_count\b)")
+
+
+def _blocked_full_page_scan(code: str):
+    """If this snippet would iterate every page of a PDF we know to be large,
+    return an explanation. This is enforced in CODE because the system prompt
+    already forbids it and the model does it anyway - and it costs 120s of a
+    240s budget to learn that lesson each time."""
+    if not _FULL_PAGE_LOOP.search(code):
+        return None
+    for quoted in re.findall(r"['\"]([^'\"]+\.pdf)['\"]", code):
+        pages = PDF_PAGE_COUNTS.get(quoted)
+        if pages and pages > LARGE_PDF_PAGES:
+            return (f"Refused before running: this loops over all {pages} pages of "
+                    f"{quoted}. On a document this size that hits the timeout and "
+                    f"returns you NOTHING - it has already cost this run dearly.\n"
+                    f"Do this instead:\n"
+                    f"  1. find_pdf_pages(url=<the same url or path>, keyword=...) "
+                    f"to get the page numbers - it is cached and takes seconds.\n"
+                    f"  2. fetch_url(url=..., pages=\"N-M\") for just those pages.\n"
+                    f"If you already know the page numbers, read them directly with a "
+                    f"bounded slice, e.g. reader.pages[200:209].")
+    return None
+
+
 def tool_run_python(code: str) -> str:
     """Run Python in a subprocess. Whatever you print() comes back to you."""
+    blocked = _blocked_full_page_scan(code)
+    if blocked:
+        return blocked
     budget = min(120, _time_left(120))
     try:
         proc = subprocess.run(
@@ -650,7 +698,12 @@ Rules:
   Use find_pdf_pages to find which pages mention the state/table/keyword you need,
   then fetch_url just that narrow range. Never guess a page range in a long report.
 - Prefer a CSV or Excel version of a dataset over a large PDF whenever one exists.
-  data.gov.in often has the same table as a clean CSV.
+  data.gov.in often has the same table as a clean CSV. MoSPI in particular publishes
+  each appendix table of a report as its OWN small spreadsheet under
+  api.mospi.gov.in/api/esankhyiki/file/download/datacatalogue/<PRODUCT>/<YEAR>/Table_<N>.xlsx
+  - if you know the table number you need (the report's Appendix A contents page
+  lists them), fetch that one small file instead of the whole report. Reading a
+  300KB spreadsheet beats hunting through a 500-page PDF every time.
 - A full "Annual Report" is often 300-600 pages and slow to search. Before opening
   one, check search results for a SMALLER, more targeted official document that
   already contains just the table you need - e.g. a PIB press release, a
