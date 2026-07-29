@@ -2,13 +2,12 @@
 Data Analyst Telegram Bot
 -------------------------
 One process that does three things:
-  1. Serves a tiny website (so your run logs have a public URL)
-  2. Polls Telegram for new messages
-  3. Runs an LLM agent that can search the web, download files and run Python
+1. Serves a tiny website (so your run logs have a public URL)
+2. Polls Telegram for new messages
+3. Runs an LLM agent that can search the web, download files and run Python
 
-Run locally:  python bot.py
+Run locally: python bot.py
 """
-
 import base64
 import os
 import re
@@ -29,7 +28,7 @@ import requests
 from flask import Flask, send_from_directory, jsonify
 from openai import OpenAI
 
-try:                                  # loads your .env file when running locally
+try:  # loads your .env file when running locally
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -47,27 +46,31 @@ PORT = int(os.environ.get("PORT", 8000))
 
 # Durable log storage (optional but strongly recommended - Render wipes its disk)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")        # e.g. "avi/tds-telegram-bot"
+GITHUB_REPO = os.environ.get("GITHUB_REPO")  # e.g. "avi/tds-telegram-bot"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
-# Memory guards - the free tier gives us 512MB for everything
-MAX_DOWNLOAD = int(os.environ.get("MAX_DOWNLOAD_MB", 8)) * 1_000_000
+# Memory guards - the free tier gives us 512MB for everything.
+# MAX_DOWNLOAD_MB should be set to 60 in your .env - real government PDFs
+# (PLFS, MOSPI, RBI reports) are routinely 20-50MB, and the old 8MB default
+# rejected them outright before the agent ever got to read them.
+MAX_DOWNLOAD = int(os.environ.get("MAX_DOWNLOAD_MB", 60)) * 1_000_000
 CHILD_MEM_MB = int(os.environ.get("CHILD_MEM_MB", 300))
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-MAX_STEPS = int(os.environ.get("MAX_STEPS", 16))
-TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 240))   # grader allows 300s
+MAX_STEPS = int(os.environ.get("MAX_STEPS", 22))  # bumped up a bit - forcing a
+                                                   # real-source read costs 1-2 extra turns
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 240))  # grader allows 300s
 
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 # Remembers the last few messages per chat, for multi-turn questions
 history: dict[int, list[str]] = {}
 last_seen: dict[int, float] = {}
-CONV_GAP = 240          # a gap this long means a NEW conversation started
-STALE_AFTER = 300       # older than the grader's timeout - answering it can only cause harm
+CONV_GAP = 240   # a gap this long means a NEW conversation started
+STALE_AFTER = 300  # older than the grader's timeout - answering it can only cause harm
 
 
 def llm(messages, log, step, deadline=None):
@@ -94,6 +97,7 @@ def llm(messages, log, step, deadline=None):
             log.write("rate_limited", step=step, attempt=attempt, sleeping=round(wait, 1))
             time.sleep(wait)
     raise last_error
+
 
 # --------------------------------------------------------------------------
 # Run log: one JSON object per line, served publicly at /logs/<id>.jsonl
@@ -179,11 +183,10 @@ def _cached_download(url: str):
     path = DOWNLOAD_DIR / (hashlib.sha1(url.encode()).hexdigest()[:16] + ext)
     if path.exists() and path.stat().st_size > 0:
         return path, True
-
     r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
     r.raise_for_status()
     size = 0
-    with path.open("wb") as f:                 # straight to disk, never all in RAM
+    with path.open("wb") as f:  # straight to disk, never all in RAM
         for chunk in r.iter_content(65536):
             size += len(chunk)
             if size > MAX_DOWNLOAD:
@@ -200,8 +203,7 @@ def tool_download_file(url: str) -> str:
         path, cached = _cached_download(url)
         size_mb = path.stat().st_size / 1e6
         note = "already downloaded earlier" if cached else "downloaded"
-        info = [f"{note}: {path}  ({size_mb:.1f} MB)"]
-
+        info = [f"{note}: {path} ({size_mb:.1f} MB)"]
         if path.suffix == ".pdf":
             try:
                 from pypdf import PdfReader
@@ -215,62 +217,6 @@ def tool_download_file(url: str) -> str:
         return f"download failed: {e}"
 
 
-def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str:
-    """Download a page or file and return readable text.
-
-    `pages` applies to PDFs only, e.g. "1-12" or "85-95". Government reports put
-    their state-wise tables deep in the document, so read the contents page
-    first, then come back for the range you actually need. Keep ranges small -
-    this runs on a 512MB box.
-    """
-    try:
-        path, _ = _cached_download(url)
-        ctype = ("pdf" if path.suffix == ".pdf" else
-                 "excel" if path.suffix in (".xlsx", ".xls") else "")
-
-        if ctype == "pdf" or url.lower().endswith(".pdf"):
-            try:
-                first, last = (int(x) for x in pages.split("-"))
-            except ValueError:
-                first, last = 1, 12
-            last = min(last, first + 14)          # never more than 15 pages at once
-            import pdfplumber
-            out = []
-            with pdfplumber.open(str(path)) as pdf:
-                total = len(pdf.pages)
-                out.append(f"[PDF has {total} pages; showing {first}-{min(last, total)}]")
-                for i in range(first - 1, min(last, total)):
-                    page = pdf.pages[i]
-                    out.append(f"\n--- page {i + 1} ---\n" + (page.extract_text() or ""))
-                    flush = getattr(page, "flush_cache", None)
-                    if flush:
-                        flush()               # release the page before loading the next
-            body = "\n".join(out)
-
-        elif any(x in ctype for x in ("excel", "spreadsheet")) or url.lower().endswith((".xlsx", ".xls")):
-            import pandas as pd
-            sheets = pd.read_excel(str(path), sheet_name=None)
-            body = "\n\n".join(f"### sheet: {n}\n{d.head(40).to_string()}" for n, d in sheets.items())
-
-        else:
-            content = path.read_bytes()[:2_000_000]
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(content.decode("utf-8", "replace"), "lxml")
-            for tag in soup(["script", "style", "nav", "footer"]):
-                tag.decompose()
-            links = [f"{a.get_text(strip=True)} -> {a['href']}"
-                     for a in soup.find_all("a", href=True)[:80]]
-            text = soup.get_text("\n", strip=True)
-            body = ((text + "\n\n--- LINKS ---\n" + "\n".join(links))
-                    if len(text) > 200 else content.decode("utf-8", "replace"))
-
-        return body[:max_chars]
-    except MemoryError:
-        return "ran out of memory reading this file. Try fewer PDF pages, or a CSV version."
-    except Exception as e:
-        return f"fetch failed: {e}"
-
-
 def _limit_child_memory():
     """Run in the child before exec. A MemoryError in the child is recoverable;
     an OOM kill takes down the whole service and wipes every log with it."""
@@ -280,6 +226,113 @@ def _limit_child_memory():
         resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
     except Exception:
         pass
+
+
+def _run_child(code: str, timeout: int = 100) -> str:
+    """Run `code` in its OWN process with a hard memory cap. This is what keeps
+    PDF/Excel parsing from ever crashing the main bot process - a crash there
+    would take down the Telegram poller and the log server with it, wiping
+    every log in flight. Whatever the child print()s comes back to the agent."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=timeout, cwd="/tmp",
+            preexec_fn=_limit_child_memory,
+        )
+        out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
+        if "MemoryError" in out:
+            out += (f"\n[hit the {CHILD_MEM_MB}MB memory cap - try a narrower "
+                    f"page range, or use find_pdf_pages to locate the right pages first]")
+        return out.strip()[:15000] or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "timed out reading this file"
+    except Exception as e:
+        return f"execution failed: {e}"
+
+
+def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str:
+    """Download a page or file and return readable text.
+    `pages` applies to PDFs only, e.g. "1-12" or "85-95". Government reports put
+    their state-wise tables deep in the document - use find_pdf_pages first to
+    locate the right page range instead of guessing, then come back for it.
+    All PDF/Excel parsing runs in an isolated, memory-capped subprocess so a
+    huge file can never crash the whole bot.
+    """
+    try:
+        path, _ = _cached_download(url)
+        is_pdf = path.suffix == ".pdf" or url.lower().endswith(".pdf")
+        is_excel = path.suffix in (".xlsx", ".xls") or url.lower().endswith((".xlsx", ".xls"))
+
+        if is_pdf:
+            try:
+                first, last = (int(x) for x in pages.split("-"))
+            except ValueError:
+                first, last = 1, 12
+            last = min(last, first + 14)  # never more than 15 pages at once
+            script = f"""
+import pypdf
+r = pypdf.PdfReader({str(path)!r})
+total = len(r.pages)
+first, last = {first}, min({last}, total)
+print(f"[PDF has {{total}} pages; showing {{first}}-{{last}}]")
+for i in range(first - 1, last):
+    print(f"\\n--- page {{i + 1}} ---")
+    print(r.pages[i].extract_text() or "")
+"""
+            return _run_child(script)[:max_chars]
+
+        elif is_excel:
+            script = f"""
+import pandas as pd
+sheets = pd.read_excel({str(path)!r}, sheet_name=None)
+for n, d in sheets.items():
+    print(f"### sheet: {{n}}")
+    print(d.head(40).to_string())
+"""
+            return _run_child(script)[:max_chars]
+
+        else:
+            content = path.read_bytes()[:2_000_000]
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(content.decode("utf-8", "replace"), "lxml")
+            for tag in soup(["script", "style", "nav", "footer"]):
+                tag.decompose()
+            links = [f"{a.get_text(strip=True)} -> {a['href']}"
+                    for a in soup.find_all("a", href=True)[:80]]
+            text = soup.get_text("\n", strip=True)
+            body = ((text + "\n\n--- LINKS ---\n" + "\n".join(links))
+                    if len(text) > 200 else content.decode("utf-8", "replace"))
+            return body[:max_chars]
+
+    except MemoryError:
+        return "ran out of memory reading this file. Try fewer PDF pages, or a CSV version."
+    except Exception as e:
+        return f"fetch failed: {e}"
+
+
+def tool_find_pdf_pages(url: str, keyword: str) -> str:
+    """Scan every page of a PDF for a keyword (a state name, 'unemployment rate',
+    'Statement 27', etc.) and report which pages mention it. Use this BEFORE
+    fetch_url on a large report instead of guessing a 15-page window - this is
+    what actually finds the real table instead of relying on search snippets,
+    which often disagree with the primary source and with each other."""
+    try:
+        path, _ = _cached_download(url)
+        script = f"""
+import pypdf
+r = pypdf.PdfReader({str(path)!r})
+kw = {keyword.lower()!r}
+hits = []
+for i, page in enumerate(r.pages):
+    if kw in (page.extract_text() or "").lower():
+        hits.append(i + 1)
+    if len(hits) >= 25:
+        break
+print("pages containing keyword:", hits if hits else "none found")
+"""
+        return _run_child(script, timeout=100)
+    except Exception as e:
+        return f"scan failed: {e}"
 
 
 def tool_run_python(code: str) -> str:
@@ -314,10 +367,19 @@ TOOL_SCHEMA = [
             "reason": {"type": "string", "description": "one line: why you are doing this"}},
             "required": ["query"]}}},
     {"type": "function", "function": {
+        "name": "find_pdf_pages",
+        "description": ("Scan a PDF for a keyword and return which page numbers mention it. "
+                        "Use this on any large report BEFORE fetch_url, instead of guessing "
+                        "a page range."),
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "keyword": {"type": "string"}},
+            "required": ["url", "keyword"]}}},
+    {"type": "function", "function": {
         "name": "fetch_url",
         "description": ("Download a URL (HTML, CSV, JSON, PDF or Excel) and read it as text. "
-                        "For PDFs use `pages` to pick a range, e.g. \"85-95\" - read the "
-                        "contents page first to find where the table is."),
+                        "For PDFs use `pages` to pick a range, e.g. \"85-95\" - use "
+                        "find_pdf_pages first to find where the table actually is."),
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "pages": {"type": "string", "description": "PDF page range, default \"1-12\", max 15 pages"},
@@ -335,7 +397,7 @@ TOOL_SCHEMA = [
     {"type": "function", "function": {
         "name": "run_python",
         "description": ("Run Python code and get whatever it prints. "
-                        "pandas, numpy, requests, bs4, openpyxl, pdfplumber are installed. "
+                        "pandas, numpy, requests, bs4, openpyxl, pypdf are installed. "
                         "Use this for all real computation."),
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string"},
@@ -357,6 +419,7 @@ TOOL_FUNCS = {
     "search_web": tool_search_web,
     "download_file": tool_download_file,
     "fetch_url": tool_fetch_url,
+    "find_pdf_pages": tool_find_pdf_pages,
     "run_python": tool_run_python,
 }
 
@@ -367,6 +430,7 @@ ALIASES = {
     "download_file": {"urls": "url", "link": "url", "file_url": "url"},
     "fetch_url": {"urls": "url", "link": "url", "page": "pages",
                   "page_range": "pages", "page_numbers": "pages"},
+    "find_pdf_pages": {"urls": "url", "link": "url", "word": "keyword", "term": "keyword"},
     "run_python": {"python": "code", "script": "code", "source": "code",
                    "python_code": "code"},
 }
@@ -378,22 +442,18 @@ def call_tool(name, args, log, step):
     fn = TOOL_FUNCS.get(name)
     if fn is None:
         return f"unknown tool '{name}'. Available: {', '.join(TOOL_FUNCS)}"
-
     args = dict(args or {})
     reason = args.pop("reason", None)
     if reason:
         log.write("tool_reason", step=step, tool=name, reason=str(reason)[:500])
-
     for wrong, right in ALIASES.get(name, {}).items():
         if wrong in args and right not in args:
             args[right] = args.pop(wrong)
-
     accepted = set(inspect.signature(fn).parameters)
     unexpected = [k for k in args if k not in accepted]
     if unexpected:
         log.write("tool_args_dropped", step=step, tool=name, dropped=unexpected)
         args = {k: v for k, v in args.items() if k in accepted}
-
     try:
         return fn(**args)
     except TypeError as e:
@@ -402,24 +462,30 @@ def call_tool(name, args, log, step):
     except Exception as e:
         return f"{name} failed: {type(e).__name__}: {e}"
 
+
 SYSTEM_PROMPT = """You are a careful data analyst agent.
 
 You are given a data-analysis question. Work out the real answer using your tools.
 
 Rules:
 - Never guess a number from memory. Find the source, download it, compute with run_python.
+- Search results and news articles are NOT the source of truth - they often disagree with
+  each other and with the real report. For any question about a specific report or dataset
+  (PLFS, MOSPI, RBI, Census, etc.), you must open the primary document itself with
+  find_pdf_pages / fetch_url / download_file before you can submit an answer. Search is only
+  for locating the document's URL, never for reading off the final number.
 - run_python is STATELESS. Each call is a brand new process: imports, variables and
   downloads from a previous call are GONE. Every snippet must import what it needs.
 - NEVER download the same file twice. Use download_file once - it saves to /tmp and
   files there DO persist between run_python calls - then open it by path.
-- For a big PDF: download_file first (it tells you the page count), then read a NARROW
-  page range. Use pypdf for plain text (light on memory); use pdfplumber only for
-  specific pages you need tables from. Never loop pdfplumber over hundreds of pages -
-  it will run out of memory.
+- For a big PDF: download_file first (it tells you the page count), then use
+  find_pdf_pages to find which pages mention the state/table/keyword you need, then
+  fetch_url just that narrow range. Never guess a page range in a long report.
 - Prefer a CSV or Excel version of a dataset over a large PDF whenever one exists.
   data.gov.in often has the same table as a clean CSV.
 - Prefer official sources (mospi.gov.in, data.gov.in, RBI, Census, World Bank, etc.).
-- If data is embedded in the question itself, just compute on it directly - no need to search.
+- If data is embedded in the question itself, just compute on it directly - no need to search
+  or open any document.
 - Read the question's JSON template carefully. Your answer must match that shape EXACTLY:
   same keys, same spelling, same data types. If it asks for a number, give a number, not a string.
 - Return EXACTLY the keys asked for and NO others. If the question asks only for "sum",
@@ -438,7 +504,6 @@ Rules:
 - When you are confident, call submit_answer once. That ends the run.
 """
 
-
 # --------------------------------------------------------------------------
 # The agent loop
 # --------------------------------------------------------------------------
@@ -451,13 +516,23 @@ def run_agent(question: str, log: RunLog):
     started = time.time()
     deadline = started + TIME_BUDGET
 
+    # Code-enforced guardrail: don't let the agent answer a question it went
+    # searching for using ONLY search snippets. Search results routinely
+    # disagree with each other and with the real report (this is exactly what
+    # made the bot answer "Nagaland" once and "Goa" another time for the same
+    # question). This is enforced here, in code, because the prompt text
+    # above is not something the grader lets us guarantee will be followed.
+    used_search = False
+    used_real_source = False
+    submit_blocks = 0
+    MAX_SUBMIT_BLOCKS = 2  # don't loop forever if the model can't find a working source
+
     for step in range(MAX_STEPS):
         out_of_time = time.time() > deadline
         if out_of_time:
             messages.append({"role": "user",
                              "content": "Time is up. Call submit_answer NOW with your best "
-                                        "answer from what you already know. No more tools."})
-
+                             "answer from what you already know. No more tools."})
         t0 = time.time()
         resp = llm(messages, log, step, deadline)
         msg = resp.choices[0].message
@@ -483,6 +558,19 @@ def run_agent(question: str, log: RunLog):
                 args = {}
 
             if name == "submit_answer":
+                block = (used_search and not used_real_source
+                         and submit_blocks < MAX_SUBMIT_BLOCKS and not out_of_time)
+                if block:
+                    submit_blocks += 1
+                    log.write("submit_blocked", step=step,
+                              reason="no primary source opened yet", attempt=submit_blocks)
+                    messages.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": "Not accepted: you've only used search_web so "
+                                     "far. Search snippets often disagree with each other and "
+                                     "with the real report. Use find_pdf_pages, fetch_url, or "
+                                     "download_file to actually open the primary source and "
+                                     "find the real answer, then call submit_answer again."})
+                    continue
                 raw = args.get("answer_json", "")
                 answer = unwrap(coerce_json(raw))
                 log.write("submit_answer", raw=raw, parsed=answer)
@@ -493,10 +581,21 @@ def run_agent(question: str, log: RunLog):
                 log.write("tool_refused", step=step, tool=name, reason="past deadline")
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": "DEADLINE PASSED. No more tools. "
-                                            "Call submit_answer immediately."})
+                                 "Call submit_answer immediately."})
                 continue
+
+            if name == "search_web":
+                used_search = True
+
             t1 = time.time()
             result = call_tool(name, args, log, step)
+
+            if name in ("fetch_url", "download_file", "find_pdf_pages"):
+                failed = str(result).lower().startswith(
+                    ("fetch failed", "download failed", "scan failed"))
+                if not failed:
+                    used_real_source = True
+
             log.write("tool_result", step=step, tool=name,
                       seconds=round(time.time() - t1, 2),
                       chars=len(str(result)),
@@ -565,8 +664,7 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
         if past:
             context = "\n".join(f"- {m}" for m in past)
             question = (f"Earlier messages in this conversation (context only):\n{context}\n\n"
-                        f"ANSWER THIS MESSAGE:\n{text}")
-
+                       f"ANSWER THIS MESSAGE:\n{text}")
         answer = run_agent(question, log)
     except Exception as e:
         traceback.print_exc()
@@ -577,10 +675,10 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
     log.write("agent_done", agent_seconds=round(agent_done - picked_up, 2))
     reply = json.dumps({"answer": answer, "log_url": log.public_url}, ensure_ascii=False)
     log.write("reply", text=reply)
-    log.publish()          # upload the COMPLETE log, reply included
+    log.publish()  # upload the COMPLETE log, reply included
     tg_send(chat_id, reply)
     if "log_url" in text:
-        history[chat_id] = []       # that message ended the exchange
+        history[chat_id] = []  # that message ended the exchange
     log.write("sent", send_seconds=round(time.time() - agent_done, 2),
               total_seconds=round(time.time() - (sent_at or picked_up), 2))
 
@@ -599,7 +697,7 @@ def chat_worker(chat_id: int, q):
                 continue
             now = time.time()
             if now - last_seen.get(chat_id, 0) > CONV_GAP:
-                history[chat_id] = []          # long gap = new question
+                history[chat_id] = []  # long gap = new question
             last_seen[chat_id] = now
             history.setdefault(chat_id, []).append(text)
             handle_message(chat_id, text, sent_at)
@@ -628,11 +726,11 @@ def poll_telegram():
                 if chat_id not in queues:
                     queues[chat_id] = queue.Queue()
                     threading.Thread(target=chat_worker, args=(chat_id, queues[chat_id]),
-                                     daemon=True).start()
+                                    daemon=True).start()
                 queues[chat_id].put((text, msg.get("date")))
         except Exception:
             traceback.print_exc()
-            time.sleep(3)
+        time.sleep(3)
 
 
 # --------------------------------------------------------------------------
