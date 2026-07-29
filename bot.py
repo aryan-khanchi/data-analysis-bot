@@ -9,6 +9,7 @@ One process that does three things:
 Run locally:  python bot.py
 """
 
+import base64
 import os
 import re
 import io
@@ -17,10 +18,10 @@ import sys
 import time
 import uuid
 import threading
+import queue
 import subprocess
 import traceback
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from flask import Flask, send_from_directory, jsonify
@@ -42,6 +43,15 @@ MODEL = os.environ.get("MODEL", "gpt-4.1-mini")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 PORT = int(os.environ.get("PORT", 8000))
 
+# Durable log storage (optional but strongly recommended - Render wipes its disk)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")        # e.g. "avi/tds-telegram-bot"
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+
+# Memory guards - the free tier gives us 512MB for everything
+MAX_DOWNLOAD = int(os.environ.get("MAX_DOWNLOAD_MB", 8)) * 1_000_000
+CHILD_MEM_MB = int(os.environ.get("CHILD_MEM_MB", 300))
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -55,9 +65,10 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 history: dict[int, list[str]] = {}
 last_seen: dict[int, float] = {}
 CONV_GAP = 240          # a gap this long means a NEW conversation started
+STALE_AFTER = 300       # older than the grader's timeout - answering it can only cause harm
 
 
-def llm(messages, log, step):
+def llm(messages, log, step, deadline=None):
     """Call the model, retrying politely when we hit the rate limit."""
     last_error = None
     for attempt in range(6):
@@ -74,6 +85,10 @@ def llm(messages, log, step):
                 raise
             m = re.search(r"retry(?:Delay|.{0,12}in)\D{0,4}(\d+(?:\.\d+)?)\s*s", text)
             wait = float(m.group(1)) + 2 if m else min(60, 5 * 2 ** attempt)
+            if deadline and time.time() + wait > deadline:
+                log.write("rate_limited_gave_up", step=step,
+                          needed=round(wait, 1), left=round(deadline - time.time(), 1))
+                raise
             log.write("rate_limited", step=step, attempt=attempt, sleeping=round(wait, 1))
             time.sleep(wait)
     raise last_error
@@ -96,6 +111,29 @@ class RunLog:
     def url(self):
         return f"{PUBLIC_BASE_URL}/logs/{self.run_id}.jsonl"
 
+    def publish(self):
+        """Mirror the finished log to GitHub. Render's disk is wiped on every
+        restart, so a log served only from here dies with the container."""
+        if not (GITHUB_TOKEN and GITHUB_REPO):
+            return self.url
+        try:
+            payload = base64.b64encode(self.path.read_bytes()).decode()
+            r = requests.put(
+                f"https://api.github.com/repos/{GITHUB_REPO}/contents/runs/{self.run_id}.jsonl",
+                headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                         "Accept": "application/vnd.github+json"},
+                json={"message": f"run log {self.run_id}", "content": payload,
+                      "branch": GITHUB_BRANCH},
+                timeout=30,
+            )
+            if r.status_code in (200, 201):
+                return (f"https://raw.githubusercontent.com/{GITHUB_REPO}/"
+                        f"{GITHUB_BRANCH}/runs/{self.run_id}.jsonl")
+            print(f"github publish failed {r.status_code}: {r.text[:200]}", flush=True)
+        except Exception as e:
+            print(f"github publish error: {e}", flush=True)
+        return self.url
+
 
 # --------------------------------------------------------------------------
 # TOOLS - the actions the agent is allowed to take
@@ -116,40 +154,79 @@ def tool_search_web(query: str) -> str:
         return f"search failed: {e}"
 
 
-def tool_fetch_url(url: str, max_chars: int = 20000) -> str:
-    """Download a page or file and return readable text."""
+def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str:
+    """Download a page or file and return readable text.
+
+    `pages` applies to PDFs only, e.g. "1-12" or "85-95". Government reports put
+    their state-wise tables deep in the document, so read the contents page
+    first, then come back for the range you actually need. Keep ranges small -
+    this runs on a 512MB box.
+    """
     try:
-        r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
         r.raise_for_status()
         ctype = r.headers.get("content-type", "").lower()
 
+        buf = bytearray()
+        for chunk in r.iter_content(65536):
+            buf.extend(chunk)
+            if len(buf) > MAX_DOWNLOAD:
+                return (f"file exceeds {MAX_DOWNLOAD // 1_000_000}MB and was not downloaded. "
+                        f"Look for a CSV or Excel version of this data instead.")
+        content = bytes(buf)
+        del buf
+
         if "pdf" in ctype or url.lower().endswith(".pdf"):
+            try:
+                first, last = (int(x) for x in pages.split("-"))
+            except ValueError:
+                first, last = 1, 12
+            last = min(last, first + 14)          # never more than 15 pages at once
             import pdfplumber
-            text = []
-            with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-                for page in pdf.pages[:25]:
-                    text.append(page.extract_text() or "")
-            body = "\n".join(text)
+            out = []
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                total = len(pdf.pages)
+                out.append(f"[PDF has {total} pages; showing {first}-{min(last, total)}]")
+                for i in range(first - 1, min(last, total)):
+                    page = pdf.pages[i]
+                    out.append(f"\n--- page {i + 1} ---\n" + (page.extract_text() or ""))
+                    flush = getattr(page, "flush_cache", None)
+                    if flush:
+                        flush()               # release the page before loading the next
+            body = "\n".join(out)
 
         elif any(x in ctype for x in ("excel", "spreadsheet")) or url.lower().endswith((".xlsx", ".xls")):
             import pandas as pd
-            sheets = pd.read_excel(io.BytesIO(r.content), sheet_name=None)
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
             body = "\n\n".join(f"### sheet: {n}\n{d.head(40).to_string()}" for n, d in sheets.items())
 
         elif "html" in ctype:
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(content.decode("utf-8", "replace"), "lxml")
             for tag in soup(["script", "style", "nav", "footer"]):
                 tag.decompose()
             links = [f"{a.get_text(strip=True)} -> {a['href']}"
                      for a in soup.find_all("a", href=True)[:80]]
             body = soup.get_text("\n", strip=True) + "\n\n--- LINKS ---\n" + "\n".join(links)
         else:
-            body = r.text
+            body = content.decode("utf-8", "replace")
 
         return body[:max_chars]
+    except MemoryError:
+        return "ran out of memory reading this file. Try fewer PDF pages, or a CSV version."
     except Exception as e:
         return f"fetch failed: {e}"
+
+
+def _limit_child_memory():
+    """Run in the child before exec. A MemoryError in the child is recoverable;
+    an OOM kill takes down the whole service and wipes every log with it."""
+    try:
+        import resource
+        cap = CHILD_MEM_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    except Exception:
+        pass
 
 
 def tool_run_python(code: str) -> str:
@@ -158,8 +235,12 @@ def tool_run_python(code: str) -> str:
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=120, cwd="/tmp",
+            preexec_fn=_limit_child_memory,
         )
         out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
+        if proc.returncode != 0 and "MemoryError" in out:
+            out += (f"\n[hit the {CHILD_MEM_MB}MB memory cap - read the file in chunks "
+                    f"with pandas' chunksize, or select fewer columns]")
         return out.strip()[:15000] or "(no output - remember to print())"
     except subprocess.TimeoutExpired:
         return "code timed out after 120s"
@@ -175,9 +256,13 @@ TOOL_SCHEMA = [
             "query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "fetch_url",
-        "description": "Download a URL (HTML, CSV, JSON, PDF or Excel) and read it as text.",
+        "description": ("Download a URL (HTML, CSV, JSON, PDF or Excel) and read it as text. "
+                        "For PDFs use `pages` to pick a range, e.g. \"85-95\" - read the "
+                        "contents page first to find where the table is."),
         "parameters": {"type": "object", "properties": {
-            "url": {"type": "string"}}, "required": ["url"]}}},
+            "url": {"type": "string"},
+            "pages": {"type": "string", "description": "PDF page range, default \"1-12\", max 15 pages"}},
+            "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "run_python",
         "description": ("Run Python code and get whatever it prints. "
@@ -240,14 +325,17 @@ def run_agent(question: str, log: RunLog):
     ]
     log.write("question", text=question)
     started = time.time()
+    deadline = started + TIME_BUDGET
 
     for step in range(MAX_STEPS):
-        if time.time() - started > TIME_BUDGET:
+        out_of_time = time.time() > deadline
+        if out_of_time:
             messages.append({"role": "user",
-                             "content": "Time is up. Call submit_answer now with your best answer."})
+                             "content": "Time is up. Call submit_answer NOW with your best "
+                                        "answer from what you already know. No more tools."})
 
         t0 = time.time()
-        resp = llm(messages, log, step)
+        resp = llm(messages, log, step, deadline)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         usage = getattr(resp, "usage", None)
@@ -277,6 +365,12 @@ def run_agent(question: str, log: RunLog):
                 return answer
 
             log.write("tool_call", step=step, tool=name, args=args)
+            if out_of_time:
+                log.write("tool_refused", step=step, tool=name, reason="past deadline")
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": "DEADLINE PASSED. No more tools. "
+                                            "Call submit_answer immediately."})
+                continue
             t1 = time.time()
             result = TOOL_FUNCS.get(name, lambda **k: "unknown tool")(**args)
             log.write("tool_result", step=step, tool=name,
@@ -356,8 +450,10 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
         answer = {"error": str(e)}
 
     agent_done = time.time()
-    reply = json.dumps({"answer": answer, "log_url": log.url}, ensure_ascii=False)
-    log.write("reply", text=reply, agent_seconds=round(agent_done - picked_up, 2))
+    log.write("agent_done", agent_seconds=round(agent_done - picked_up, 2))
+    log_url = log.publish()
+    reply = json.dumps({"answer": answer, "log_url": log_url}, ensure_ascii=False)
+    log.write("reply", text=reply)
     tg_send(chat_id, reply)
     if "log_url" in text:
         history[chat_id] = []       # that message ended the exchange
@@ -365,9 +461,33 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
               total_seconds=round(time.time() - (sent_at or picked_up), 2))
 
 
+def chat_worker(chat_id: int, q):
+    """One worker per chat. Messages are answered strictly in the order they
+    arrived, so a fast question can never overtake a slow one."""
+    while True:
+        text, sent_at = q.get()
+        try:
+            age = time.time() - sent_at if sent_at else 0
+            if age > STALE_AFTER:
+                # The grader has already given up on this one. Replying now would
+                # land our answer inside the NEXT question's conversation.
+                print(f"[{chat_id}] dropping stale message ({age:.0f}s old)", flush=True)
+                continue
+            now = time.time()
+            if now - last_seen.get(chat_id, 0) > CONV_GAP:
+                history[chat_id] = []          # long gap = new question
+            last_seen[chat_id] = now
+            history.setdefault(chat_id, []).append(text)
+            handle_message(chat_id, text, sent_at)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            q.task_done()
+
+
 def poll_telegram():
     print("Telegram polling started", flush=True)
-    pool = ThreadPoolExecutor(max_workers=4)
+    queues: dict[int, "queue.Queue"] = {}
     offset = None
     while True:
         try:
@@ -381,12 +501,11 @@ def poll_telegram():
                 if not text or not chat_id:
                     continue
                 print(f"[{chat_id}] {text[:120]}", flush=True)
-                now = time.time()
-                if now - last_seen.get(chat_id, 0) > CONV_GAP:
-                    history[chat_id] = []          # long gap = new question
-                last_seen[chat_id] = now
-                history.setdefault(chat_id, []).append(text)
-                pool.submit(handle_message, chat_id, text, msg.get("date"))
+                if chat_id not in queues:
+                    queues[chat_id] = queue.Queue()
+                    threading.Thread(target=chat_worker, args=(chat_id, queues[chat_id]),
+                                     daemon=True).start()
+                queues[chat_id].put((text, msg.get("date")))
         except Exception:
             traceback.print_exc()
             time.sleep(3)
