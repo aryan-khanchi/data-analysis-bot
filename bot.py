@@ -12,6 +12,7 @@ Run locally:  python bot.py
 import base64
 import os
 import re
+import hashlib
 import inspect
 import io
 import json
@@ -57,8 +58,8 @@ TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-MAX_STEPS = 14           # how many tool calls the agent may make
-TIME_BUDGET = 210        # seconds before we force an answer
+MAX_STEPS = int(os.environ.get("MAX_STEPS", 16))
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 240))   # grader allows 300s
 
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
@@ -163,6 +164,57 @@ def tool_search_web(query) -> str:
         return f"search failed: {e}"
 
 
+DOWNLOAD_DIR = Path("/tmp/downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cached_download(url: str):
+    """Fetch a URL to disk once. Later calls for the same URL are free.
+    Returns (path, from_cache) or raises."""
+    ext = ""
+    for e in (".pdf", ".xlsx", ".xls", ".csv", ".json", ".zip"):
+        if url.lower().split("?")[0].endswith(e):
+            ext = e
+            break
+    path = DOWNLOAD_DIR / (hashlib.sha1(url.encode()).hexdigest()[:16] + ext)
+    if path.exists() and path.stat().st_size > 0:
+        return path, True
+
+    r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
+    r.raise_for_status()
+    size = 0
+    with path.open("wb") as f:                 # straight to disk, never all in RAM
+        for chunk in r.iter_content(65536):
+            size += len(chunk)
+            if size > MAX_DOWNLOAD:
+                f.close()
+                path.unlink(missing_ok=True)
+                raise ValueError(f"file exceeds {MAX_DOWNLOAD // 1_000_000}MB")
+            f.write(chunk)
+    return path, False
+
+
+def tool_download_file(url: str) -> str:
+    """Download once, keep it on disk, and report what's inside."""
+    try:
+        path, cached = _cached_download(url)
+        size_mb = path.stat().st_size / 1e6
+        note = "already downloaded earlier" if cached else "downloaded"
+        info = [f"{note}: {path}  ({size_mb:.1f} MB)"]
+
+        if path.suffix == ".pdf":
+            try:
+                from pypdf import PdfReader
+                info.append(f"PDF with {len(PdfReader(str(path)).pages)} pages")
+            except Exception:
+                pass
+        info.append("This file stays on disk. In run_python, open it by PATH - "
+                    "do NOT download it again.")
+        return "\n".join(info)
+    except Exception as e:
+        return f"download failed: {e}"
+
+
 def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str:
     """Download a page or file and return readable text.
 
@@ -172,20 +224,11 @@ def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str
     this runs on a 512MB box.
     """
     try:
-        r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
-        r.raise_for_status()
-        ctype = r.headers.get("content-type", "").lower()
+        path, _ = _cached_download(url)
+        ctype = ("pdf" if path.suffix == ".pdf" else
+                 "excel" if path.suffix in (".xlsx", ".xls") else "")
 
-        buf = bytearray()
-        for chunk in r.iter_content(65536):
-            buf.extend(chunk)
-            if len(buf) > MAX_DOWNLOAD:
-                return (f"file exceeds {MAX_DOWNLOAD // 1_000_000}MB and was not downloaded. "
-                        f"Look for a CSV or Excel version of this data instead.")
-        content = bytes(buf)
-        del buf
-
-        if "pdf" in ctype or url.lower().endswith(".pdf"):
+        if ctype == "pdf" or url.lower().endswith(".pdf"):
             try:
                 first, last = (int(x) for x in pages.split("-"))
             except ValueError:
@@ -193,7 +236,7 @@ def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str
             last = min(last, first + 14)          # never more than 15 pages at once
             import pdfplumber
             out = []
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
+            with pdfplumber.open(str(path)) as pdf:
                 total = len(pdf.pages)
                 out.append(f"[PDF has {total} pages; showing {first}-{min(last, total)}]")
                 for i in range(first - 1, min(last, total)):
@@ -206,19 +249,20 @@ def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str
 
         elif any(x in ctype for x in ("excel", "spreadsheet")) or url.lower().endswith((".xlsx", ".xls")):
             import pandas as pd
-            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
+            sheets = pd.read_excel(str(path), sheet_name=None)
             body = "\n\n".join(f"### sheet: {n}\n{d.head(40).to_string()}" for n, d in sheets.items())
 
-        elif "html" in ctype:
+        else:
+            content = path.read_bytes()[:2_000_000]
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(content.decode("utf-8", "replace"), "lxml")
             for tag in soup(["script", "style", "nav", "footer"]):
                 tag.decompose()
             links = [f"{a.get_text(strip=True)} -> {a['href']}"
                      for a in soup.find_all("a", href=True)[:80]]
-            body = soup.get_text("\n", strip=True) + "\n\n--- LINKS ---\n" + "\n".join(links)
-        else:
-            body = content.decode("utf-8", "replace")
+            text = soup.get_text("\n", strip=True)
+            body = ((text + "\n\n--- LINKS ---\n" + "\n".join(links))
+                    if len(text) > 200 else content.decode("utf-8", "replace"))
 
         return body[:max_chars]
     except MemoryError:
@@ -247,6 +291,10 @@ def tool_run_python(code: str) -> str:
             preexec_fn=_limit_child_memory,
         )
         out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
+        if proc.returncode != 0 and ("NameError" in out or "ModuleNotFoundError" in out):
+            out += ("\n[each run_python call is a FRESH process - re-import every module "
+                    "and re-create every variable inside this snippet. Downloaded files "
+                    "in /tmp do persist.]")
         if proc.returncode != 0 and "MemoryError" in out:
             out += (f"\n[hit the {CHILD_MEM_MB}MB memory cap - read the file in chunks "
                     f"with pandas' chunksize, or select fewer columns]")
@@ -276,6 +324,15 @@ TOOL_SCHEMA = [
             "reason": {"type": "string", "description": "one line: why you are doing this"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
+        "name": "download_file",
+        "description": ("Download a big file ONCE and keep it on disk. Returns the local path "
+                        "and, for PDFs, the page count. Use this before run_python for any "
+                        "large PDF/Excel/CSV, then open it by path."),
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "reason": {"type": "string", "description": "one line: why you are doing this"}},
+            "required": ["url"]}}},
+    {"type": "function", "function": {
         "name": "run_python",
         "description": ("Run Python code and get whatever it prints. "
                         "pandas, numpy, requests, bs4, openpyxl, pdfplumber are installed. "
@@ -298,6 +355,7 @@ TOOL_SCHEMA = [
 
 TOOL_FUNCS = {
     "search_web": tool_search_web,
+    "download_file": tool_download_file,
     "fetch_url": tool_fetch_url,
     "run_python": tool_run_python,
 }
@@ -306,6 +364,7 @@ TOOL_FUNCS = {
 ALIASES = {
     "search_web": {"queries": "query", "q": "query", "search_query": "query",
                    "text": "query", "keywords": "query"},
+    "download_file": {"urls": "url", "link": "url", "file_url": "url"},
     "fetch_url": {"urls": "url", "link": "url", "page": "pages",
                   "page_range": "pages", "page_numbers": "pages"},
     "run_python": {"python": "code", "script": "code", "source": "code",
@@ -349,6 +408,16 @@ You are given a data-analysis question. Work out the real answer using your tool
 
 Rules:
 - Never guess a number from memory. Find the source, download it, compute with run_python.
+- run_python is STATELESS. Each call is a brand new process: imports, variables and
+  downloads from a previous call are GONE. Every snippet must import what it needs.
+- NEVER download the same file twice. Use download_file once - it saves to /tmp and
+  files there DO persist between run_python calls - then open it by path.
+- For a big PDF: download_file first (it tells you the page count), then read a NARROW
+  page range. Use pypdf for plain text (light on memory); use pdfplumber only for
+  specific pages you need tables from. Never loop pdfplumber over hundreds of pages -
+  it will run out of memory.
+- Prefer a CSV or Excel version of a dataset over a large PDF whenever one exists.
+  data.gov.in often has the same table as a clean CSV.
 - Prefer official sources (mospi.gov.in, data.gov.in, RBI, Census, World Bank, etc.).
 - If data is embedded in the question itself, just compute on it directly - no need to search.
 - Read the question's JSON template carefully. Your answer must match that shape EXACTLY:
