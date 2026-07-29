@@ -12,6 +12,7 @@ Run locally:  python bot.py
 import base64
 import os
 import re
+import inspect
 import io
 import json
 import sys
@@ -111,6 +112,13 @@ class RunLog:
     def url(self):
         return f"{PUBLIC_BASE_URL}/logs/{self.run_id}.jsonl"
 
+    @property
+    def public_url(self):
+        if GITHUB_TOKEN and GITHUB_REPO:
+            return (f"https://raw.githubusercontent.com/{GITHUB_REPO}/"
+                    f"{GITHUB_BRANCH}/runs/{self.run_id}.jsonl")
+        return self.url
+
     def publish(self):
         """Mirror the finished log to GitHub. Render's disk is wiped on every
         restart, so a log served only from here dies with the container."""
@@ -138,18 +146,19 @@ class RunLog:
 # --------------------------------------------------------------------------
 # TOOLS - the actions the agent is allowed to take
 # --------------------------------------------------------------------------
-def tool_search_web(query: str) -> str:
-    """Search the web and return titles, links and snippets."""
+def tool_search_web(query) -> str:
+    """Search the web. Accepts one query or a list of them."""
+    queries = query if isinstance(query, list) else [query]
+    out = []
     try:
         from ddgs import DDGS
         with DDGS() as ddg:
-            hits = list(ddg.text(query, max_results=8))
-        if not hits:
-            return "No results."
-        return "\n".join(
-            f"- {h.get('title')}\n  {h.get('href')}\n  {h.get('body','')[:300]}"
-            for h in hits
-        )
+            for q in queries[:3]:
+                hits = list(ddg.text(str(q), max_results=8))
+                out.append(f"### results for: {q}")
+                out.extend(f"- {h.get('title')}\n  {h.get('href')}\n  {h.get('body','')[:300]}"
+                           for h in hits) if hits else out.append("(no results)")
+        return "\n".join(out)
     except Exception as e:
         return f"search failed: {e}"
 
@@ -253,7 +262,9 @@ TOOL_SCHEMA = [
         "name": "search_web",
         "description": "Search the web for datasets, pages or facts.",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string"}}, "required": ["query"]}}},
+            "query": {"type": "string"},
+            "reason": {"type": "string", "description": "one line: why you are doing this"}},
+            "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "fetch_url",
         "description": ("Download a URL (HTML, CSV, JSON, PDF or Excel) and read it as text. "
@@ -261,7 +272,8 @@ TOOL_SCHEMA = [
                         "contents page first to find where the table is."),
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
-            "pages": {"type": "string", "description": "PDF page range, default \"1-12\", max 15 pages"}},
+            "pages": {"type": "string", "description": "PDF page range, default \"1-12\", max 15 pages"},
+            "reason": {"type": "string", "description": "one line: why you are doing this"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "run_python",
@@ -269,7 +281,9 @@ TOOL_SCHEMA = [
                         "pandas, numpy, requests, bs4, openpyxl, pdfplumber are installed. "
                         "Use this for all real computation."),
         "parameters": {"type": "object", "properties": {
-            "code": {"type": "string"}}, "required": ["code"]}}},
+            "code": {"type": "string"},
+            "reason": {"type": "string", "description": "one line: why you are doing this"}},
+            "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "submit_answer",
         "description": "Submit the final answer. Call this exactly once, at the end.",
@@ -287,6 +301,47 @@ TOOL_FUNCS = {
     "fetch_url": tool_fetch_url,
     "run_python": tool_run_python,
 }
+
+# Models improvise on the schema. Map the common inventions onto real parameters.
+ALIASES = {
+    "search_web": {"queries": "query", "q": "query", "search_query": "query",
+                   "text": "query", "keywords": "query"},
+    "fetch_url": {"urls": "url", "link": "url", "page": "pages",
+                  "page_range": "pages", "page_numbers": "pages"},
+    "run_python": {"python": "code", "script": "code", "source": "code",
+                   "python_code": "code"},
+}
+
+
+def call_tool(name, args, log, step):
+    """Never let a malformed tool call end the run. Hand the model the error
+    instead - it can usually correct itself on the next step."""
+    fn = TOOL_FUNCS.get(name)
+    if fn is None:
+        return f"unknown tool '{name}'. Available: {', '.join(TOOL_FUNCS)}"
+
+    args = dict(args or {})
+    reason = args.pop("reason", None)
+    if reason:
+        log.write("tool_reason", step=step, tool=name, reason=str(reason)[:500])
+
+    for wrong, right in ALIASES.get(name, {}).items():
+        if wrong in args and right not in args:
+            args[right] = args.pop(wrong)
+
+    accepted = set(inspect.signature(fn).parameters)
+    unexpected = [k for k in args if k not in accepted]
+    if unexpected:
+        log.write("tool_args_dropped", step=step, tool=name, dropped=unexpected)
+        args = {k: v for k, v in args.items() if k in accepted}
+
+    try:
+        return fn(**args)
+    except TypeError as e:
+        return (f"wrong arguments for {name}: {e}. "
+                f"This tool accepts: {sorted(accepted)}. Try again.")
+    except Exception as e:
+        return f"{name} failed: {type(e).__name__}: {e}"
 
 SYSTEM_PROMPT = """You are a careful data analyst agent.
 
@@ -372,7 +427,7 @@ def run_agent(question: str, log: RunLog):
                                             "Call submit_answer immediately."})
                 continue
             t1 = time.time()
-            result = TOOL_FUNCS.get(name, lambda **k: "unknown tool")(**args)
+            result = call_tool(name, args, log, step)
             log.write("tool_result", step=step, tool=name,
                       seconds=round(time.time() - t1, 2),
                       chars=len(str(result)),
@@ -451,9 +506,9 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
 
     agent_done = time.time()
     log.write("agent_done", agent_seconds=round(agent_done - picked_up, 2))
-    log_url = log.publish()
-    reply = json.dumps({"answer": answer, "log_url": log_url}, ensure_ascii=False)
+    reply = json.dumps({"answer": answer, "log_url": log.public_url}, ensure_ascii=False)
     log.write("reply", text=reply)
+    log.publish()          # upload the COMPLETE log, reply included
     tg_send(chat_id, reply)
     if "log_url" in text:
         history[chat_id] = []       # that message ended the exchange
