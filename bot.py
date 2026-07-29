@@ -53,6 +53,30 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
 # Remembers the last few messages per chat, for multi-turn questions
 history: dict[int, list[str]] = {}
+last_seen: dict[int, float] = {}
+CONV_GAP = 240          # a gap this long means a NEW conversation started
+
+
+def llm(messages, log, step):
+    """Call the model, retrying politely when we hit the rate limit."""
+    last_error = None
+    for attempt in range(6):
+        try:
+            return client.chat.completions.create(
+                model=MODEL, messages=messages, tools=TOOL_SCHEMA, temperature=0,
+            )
+        except Exception as e:
+            last_error = e
+            text = str(e)
+            rate_limited = ("429" in text or "RESOURCE_EXHAUSTED" in text
+                            or "rate limit" in text.lower())
+            if not rate_limited:
+                raise
+            m = re.search(r"retry(?:Delay|.{0,12}in)\D{0,4}(\d+(?:\.\d+)?)\s*s", text)
+            wait = float(m.group(1)) + 2 if m else min(60, 5 * 2 ** attempt)
+            log.write("rate_limited", step=step, attempt=attempt, sleeping=round(wait, 1))
+            time.sleep(wait)
+    raise last_error
 
 # --------------------------------------------------------------------------
 # Run log: one JSON object per line, served publicly at /logs/<id>.jsonl
@@ -189,7 +213,13 @@ Rules:
 - If data is embedded in the question itself, just compute on it directly - no need to search.
 - Read the question's JSON template carefully. Your answer must match that shape EXACTLY:
   same keys, same spelling, same data types. If it asks for a number, give a number, not a string.
-- Do NOT include "log_url" in your answer - that is added automatically.
+- Return EXACTLY the keys asked for and NO others. If the question asks only for "sum",
+  do not also include mean, median, min or max. Extra keys are marked wrong.
+- submit_answer takes ONLY the inner value. If the template is
+  {"answer": {"state": "..."}, "log_url": "..."}, you submit {"state": "..."} - not the
+  whole envelope, and never a "log_url" key.
+- Earlier messages are context only. If a question refers to data given "at the start",
+  it means the start of THIS exchange - never data from an older, unrelated question.
 - Work efficiently. Every tool call costs a round trip, so do not use run_python for
   trivial arithmetic you can do reliably in your head. Use it for real data work:
   parsing files, aggregating rows, sorting, statistics.
@@ -217,9 +247,7 @@ def run_agent(question: str, log: RunLog):
                              "content": "Time is up. Call submit_answer now with your best answer."})
 
         t0 = time.time()
-        resp = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOL_SCHEMA, temperature=0,
-        )
+        resp = llm(messages, log, step)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         usage = getattr(resp, "usage", None)
@@ -244,7 +272,7 @@ def run_agent(question: str, log: RunLog):
 
             if name == "submit_answer":
                 raw = args.get("answer_json", "")
-                answer = coerce_json(raw)
+                answer = unwrap(coerce_json(raw))
                 log.write("submit_answer", raw=raw, parsed=answer)
                 return answer
 
@@ -259,6 +287,22 @@ def run_agent(question: str, log: RunLog):
 
     log.write("give_up", reason="step limit reached")
     return {"error": "could not determine answer"}
+
+
+def unwrap(value):
+    """The model sometimes submits the whole envelope by mistake, e.g.
+    {"answer": {"region": "East"}} when it should have submitted just
+    {"region": "East"}. Peel that off. Also drops a stray log_url."""
+    for _ in range(3):
+        if not isinstance(value, dict):
+            break
+        if set(value) <= {"answer", "log_url"} and isinstance(value.get("answer"), (dict, list)):
+            value = value["answer"]
+            continue
+        if "log_url" in value and len(value) > 1:
+            value = {k: v for k, v in value.items() if k != "log_url"}
+        break
+    return value
 
 
 def coerce_json(raw: str):
@@ -315,6 +359,8 @@ def handle_message(chat_id: int, text: str, sent_at: float | None = None):
     reply = json.dumps({"answer": answer, "log_url": log.url}, ensure_ascii=False)
     log.write("reply", text=reply, agent_seconds=round(agent_done - picked_up, 2))
     tg_send(chat_id, reply)
+    if "log_url" in text:
+        history[chat_id] = []       # that message ended the exchange
     log.write("sent", send_seconds=round(time.time() - agent_done, 2),
               total_seconds=round(time.time() - (sent_at or picked_up), 2))
 
@@ -335,6 +381,10 @@ def poll_telegram():
                 if not text or not chat_id:
                     continue
                 print(f"[{chat_id}] {text[:120]}", flush=True)
+                now = time.time()
+                if now - last_seen.get(chat_id, 0) > CONV_GAP:
+                    history[chat_id] = []          # long gap = new question
+                last_seen[chat_id] = now
                 history.setdefault(chat_id, []).append(text)
                 pool.submit(handle_message, chat_id, text, msg.get("date"))
         except Exception:
