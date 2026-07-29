@@ -174,7 +174,17 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 def _cached_download(url: str):
     """Fetch a URL to disk once. Later calls for the same URL are free.
-    Returns (path, from_cache) or raises."""
+    Returns (path, from_cache) or raises.
+
+    Also accepts a LOCAL PATH that was already downloaded earlier (e.g. the
+    path returned by download_file). The agent is told to reuse files by
+    path instead of re-downloading them - so every tool that calls this must
+    handle being handed a path, not just a URL, or it fails instantly and the
+    agent falls back to much slower ways of reading the file."""
+    maybe_path = Path(url)
+    if maybe_path.exists() and maybe_path.is_file():
+        return maybe_path, True
+
     ext = ""
     for e in (".pdf", ".xlsx", ".xls", ".csv", ".json", ".zip"):
         if url.lower().split("?")[0].endswith(e):
@@ -198,7 +208,8 @@ def _cached_download(url: str):
 
 
 def tool_download_file(url: str) -> str:
-    """Download once, keep it on disk, and report what's inside."""
+    """Download once, keep it on disk, and report what's inside. Safe to call
+    again with the SAME url later - it's free, since the file is already on disk."""
     try:
         path, cached = _cached_download(url)
         size_mb = path.stat().st_size / 1e6
@@ -251,7 +262,9 @@ def _run_child(code: str, timeout: int = 100) -> str:
 
 
 def tool_fetch_url(url: str, max_chars: int = 20000, pages: str = "1-12") -> str:
-    """Download a page or file and return readable text.
+    """Download a page or file and return readable text. `url` can be a web
+    address OR a local path returned earlier by download_file - either works,
+    and a local path is instant (no re-download).
     `pages` applies to PDFs only, e.g. "1-12" or "85-95". Government reports put
     their state-wise tables deep in the document - use find_pdf_pages first to
     locate the right page range instead of guessing, then come back for it.
@@ -312,10 +325,12 @@ for n, d in sheets.items():
 
 def tool_find_pdf_pages(url: str, keyword: str) -> str:
     """Scan every page of a PDF for a keyword (a state name, 'unemployment rate',
-    'Statement 27', etc.) and report which pages mention it. Use this BEFORE
-    fetch_url on a large report instead of guessing a 15-page window - this is
-    what actually finds the real table instead of relying on search snippets,
-    which often disagree with the primary source and with each other."""
+    'Statement 27', etc.) and report which pages mention it. `url` can be a web
+    address OR a local path returned earlier by download_file - either works,
+    and a local path is instant (no re-download). Use this BEFORE fetch_url on
+    a large report instead of guessing a 15-page window - this is what actually
+    finds the real table instead of relying on search snippets, which often
+    disagree with the primary source and with each other."""
     try:
         path, _ = _cached_download(url)
         script = f"""
@@ -478,12 +493,25 @@ Rules:
   downloads from a previous call are GONE. Every snippet must import what it needs.
 - NEVER download the same file twice. Use download_file once - it saves to /tmp and
   files there DO persist between run_python calls - then open it by path.
-- For a big PDF: download_file first (it tells you the page count), then use
-  find_pdf_pages to find which pages mention the state/table/keyword you need, then
-  fetch_url just that narrow range. Never guess a page range in a long report.
+- For a big PDF: download_file it ONCE, then reuse it by passing the SAME url or the
+  local path it gives you back to find_pdf_pages / fetch_url - never re-download.
+  Use find_pdf_pages to find which pages mention the state/table/keyword you need,
+  then fetch_url just that narrow range. Never guess a page range in a long report.
 - Prefer a CSV or Excel version of a dataset over a large PDF whenever one exists.
   data.gov.in often has the same table as a clean CSV.
-- Prefer official sources (mospi.gov.in, data.gov.in, RBI, Census, World Bank, etc.).
+- A full "Annual Report" is often 300-600 pages and slow to search. Before opening
+  one, check search results for a SMALLER, more targeted official document that
+  already contains just the table you need - e.g. a PIB press release, a
+  parliament (Lok Sabha/Rajya Sabha, sansad.in) reply, or a ministry press note.
+  These are usually a few pages and often already have the exact state-wise
+  breakdown you're looking for. Only fall back to the full annual report if
+  nothing smaller has the answer.
+- Government PDFs are sometimes bilingual (Hindi followed by English, or vice
+  versa). If your keyword search matches too many pages or none, try the
+  English name/spelling and check whether the document has a separate English
+  section rather than scanning the whole thing indiscriminately.
+- Prefer official sources (mospi.gov.in, pib.gov.in, sansad.in, data.gov.in, RBI,
+  Census, World Bank, etc.).
 - If data is embedded in the question itself, just compute on it directly - no need to search
   or open any document.
 - Read the question's JSON template carefully. Your answer must match that shape EXACTLY:
