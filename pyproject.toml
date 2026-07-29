@@ -13,6 +13,7 @@ dependencies = [
     "lxml>=5.2",
     "openpyxl>=3.1",
     "pdfplumber>=0.11",
+    "pypdf>=5.0",
     "ddgs>=6.0",
     "python-dotenv>=1.0",
 ]
