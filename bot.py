@@ -60,9 +60,30 @@ TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-MAX_STEPS = int(os.environ.get("MAX_STEPS", 22))  # bumped up a bit - forcing a
-                                                   # real-source read costs 1-2 extra turns
-TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 240))  # grader allows 300s
+# Reasoning / "thinking" tokens. Empty = off (the default for lite-tier models).
+# Set REASONING_EFFORT to low / medium / high to make the model deliberate before
+# acting. OpenRouter normalises this across providers. NOTE: reasoning tokens are
+# billed as OUTPUT tokens and add latency, so they eat both your credit and your
+# TIME_BUDGET - start with "low".
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip().lower()
+
+MAX_STEPS = int(os.environ.get("MAX_STEPS", 24))  # search is now capped separately
+                                                   # (SEARCH_CALL_LIMIT), so most of this
+                                                   # budget should go toward actually reading
+                                                   # documents rather than re-searching
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 240))
+# Grounded in the real pipeline (Jivraj-18/tds-p1-t2-2026-telegram-bot):
+# collect.py uses question.get("timeout_seconds", 300) and the README's own
+# question template sets 300, so 300 is the working ceiling. 240 leaves 60s for
+# the final forced submit_answer turn, the GitHub log publish and the Telegram
+# send. Note timeout_seconds covers the WHOLE (possibly multi-turn) exchange,
+# so a 3-message question shares one window across all three replies - another
+# reason not to spend the full ceiling on any single reply.
+
+# Seconds a single find_pdf_pages call may spend extracting text before it stops,
+# saves progress, and returns what it has. Kept well under the subprocess timeout
+# so a partial answer always gets back to the agent.
+PDF_SCAN_BUDGET = int(os.environ.get("PDF_SCAN_BUDGET", 70))
 
 client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
@@ -70,16 +91,60 @@ client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 history: dict[int, list[str]] = {}
 last_seen: dict[int, float] = {}
 CONV_GAP = 240   # a gap this long means a NEW conversation started
-STALE_AFTER = 300  # older than the grader's timeout - answering it can only cause harm
+STALE_AFTER = 300  # matches collect.py's default timeout_seconds (300). A message
+                   # older than this was abandoned by the grader; replying now would
+                   # land our answer inside the NEXT question's conversation.
+
+
+OFFICIAL_DOMAINS = ("mospi.gov.in", "pib.gov.in", "data.gov.in", "sansad.in",
+                    "rbi.org.in", "censusindia.gov.in", "esankhyiki.mospi.gov.in",
+                    "microdata.gov.in", "dge.gov.in")
+
+
+def _extract_candidate_urls(text: str) -> list[str]:
+    """Pull out links to official-domain documents from a block of search
+    results, so we can point the agent back at what it already found instead
+    of letting it search for the same thing over and over."""
+    urls = re.findall(r"https?://[^\s)\]]+", text)
+    seen, out = set(), []
+    for u in urls:
+        u = u.rstrip(".,")
+        if any(d in u for d in OFFICIAL_DOMAINS) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+# Per-chat-worker deadline, so a tool can't run past the agent's deadline.
+# collect.py awaits each reply within timeout_seconds for the WHOLE exchange
+# (default 300), and our deadline is only checked BETWEEN steps - so without this
+# a run_python started 1s before the deadline would add another 120s and blow
+# straight past the grader's ceiling. One worker thread per chat, hence threading.local.
+_ctx = threading.local()
+
+
+def _time_left(default: int = 120) -> int:
+    """Seconds until this run's deadline. Never returns less than 5 so a tool
+    still gets a chance to fail fast rather than being handed a zero timeout."""
+    deadline = getattr(_ctx, "deadline", None)
+    if deadline is None:
+        return default
+    return max(5, int(deadline - time.time()))
 
 
 def llm(messages, log, step, deadline=None):
     """Call the model, retrying politely when we hit the rate limit."""
     last_error = None
+    kwargs = {}
+    if REASONING_EFFORT in ("low", "medium", "high"):
+        # OpenRouter's unified reasoning parameter. Passed via extra_body because
+        # it isn't part of the standard OpenAI schema the SDK knows about.
+        kwargs["extra_body"] = {"reasoning": {"effort": REASONING_EFFORT}}
     for attempt in range(6):
         try:
             return client.chat.completions.create(
                 model=MODEL, messages=messages, tools=TOOL_SCHEMA, temperature=0,
+                **kwargs,
             )
         except Exception as e:
             last_error = e
@@ -193,7 +258,8 @@ def _cached_download(url: str):
     path = DOWNLOAD_DIR / (hashlib.sha1(url.encode()).hexdigest()[:16] + ext)
     if path.exists() and path.stat().st_size > 0:
         return path, True
-    r = requests.get(url, timeout=120, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
+    r = requests.get(url, timeout=min(120, _time_left()),
+                     headers={"User-Agent": "Mozilla/5.0"}, stream=True)
     r.raise_for_status()
     size = 0
     with path.open("wb") as f:  # straight to disk, never all in RAM
@@ -244,6 +310,7 @@ def _run_child(code: str, timeout: int = 100) -> str:
     PDF/Excel parsing from ever crashing the main bot process - a crash there
     would take down the Telegram poller and the log server with it, wiping
     every log in flight. Whatever the child print()s comes back to the agent."""
+    timeout = min(timeout, _time_left(timeout))
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code],
@@ -323,39 +390,118 @@ for n, d in sheets.items():
         return f"fetch failed: {e}"
 
 
+# Text-extraction script for find_pdf_pages. Written as a plain template (not an
+# f-string) so the embedded Python's braces don't need escaping. Placeholders are
+# substituted with repr()'d values before it runs in a memory-capped subprocess.
+#
+# The important property: it works to a TIME BUDGET and always prints what it
+# managed to find, then saves its progress. A 572-page government report cannot be
+# text-extracted in one go on a free-tier box, so a scan that either finishes or
+# returns nothing is useless. This one returns partial results and can be resumed.
+_PDF_SCAN_SCRIPT = '''
+import json, time
+from pathlib import Path
+
+pdf = __PDF_PATH__
+kw = __KEYWORD__
+budget = __BUDGET__
+
+cache_path = Path(pdf + ".pages.json")
+cache = {}
+if cache_path.exists():
+    try:
+        cache = json.loads(cache_path.read_text())
+    except Exception:
+        cache = {}
+
+engine = "pypdf"
+try:
+    import fitz  # PyMuPDF - roughly 10-30x faster than pypdf if installed
+    doc = fitz.open(pdf)
+    total = doc.page_count
+    def get_text(i):
+        return doc.load_page(i).get_text()
+    engine = "pymupdf"
+except Exception:
+    import pypdf
+    reader = pypdf.PdfReader(pdf)
+    total = len(reader.pages)
+    def get_text(i):
+        return reader.pages[i].extract_text() or ""
+
+start = time.time()
+added = 0
+MIN_PAGES = 25  # always make SOME progress, even if the budget is already blown -
+                # otherwise repeated calls advance zero pages and loop forever
+for i in range(total):
+    key = str(i + 1)
+    if key in cache:
+        continue
+    if added >= MIN_PAGES and time.time() - start > budget:
+        break
+    try:
+        cache[key] = get_text(i)
+    except Exception:
+        cache[key] = ""
+    added += 1
+
+try:
+    cache_path.write_text(json.dumps(cache))
+except Exception as e:
+    print("warning: could not save scan cache:", e)
+
+hits = sorted(int(k) for k, v in cache.items() if kw in v.lower())
+scanned = len(cache)
+
+print("engine=" + engine + " scanned=" + str(scanned) + "/" + str(total)
+      + " (this call added " + str(added) + ")")
+if hits:
+    print("pages containing keyword:", hits[:40])
+    print("tip: now call fetch_url on this same file with a pages range around a hit, e.g. pages=330-344")
+else:
+    print("keyword not found in the " + str(scanned) + " pages scanned so far")
+
+if scanned < total:
+    print("NOT FINISHED - " + str(total - scanned) + " pages still unscanned. "
+          "Call find_pdf_pages again with the SAME url to continue; pages already "
+          "scanned are cached and cost nothing. Or try a shorter/different keyword.")
+else:
+    print("scan complete - the whole document has been checked.")
+'''
+
+
 def tool_find_pdf_pages(url: str, keyword: str) -> str:
-    """Scan every page of a PDF for a keyword (a state name, 'unemployment rate',
-    'Statement 27', etc.) and report which pages mention it. `url` can be a web
-    address OR a local path returned earlier by download_file - either works,
-    and a local path is instant (no re-download). Use this BEFORE fetch_url on
-    a large report instead of guessing a 15-page window - this is what actually
-    finds the real table instead of relying on search snippets, which often
-    disagree with the primary source and with each other."""
+    """Find which pages of a PDF mention a keyword. `url` can be a web address OR
+    a local path from download_file.
+
+    Built to survive huge reports: it extracts page text under a time budget,
+    CACHES what it extracted to disk, and returns whatever it found so far. If it
+    couldn't finish, call it again with the same url - it resumes from where it
+    stopped and previously-scanned pages are instant. Never loop over all pages
+    yourself in run_python; that just times out and returns nothing."""
     try:
         path, _ = _cached_download(url)
-        script = f"""
-import pypdf
-r = pypdf.PdfReader({str(path)!r})
-kw = {keyword.lower()!r}
-hits = []
-for i, page in enumerate(r.pages):
-    if kw in (page.extract_text() or "").lower():
-        hits.append(i + 1)
-    if len(hits) >= 25:
-        break
-print("pages containing keyword:", hits if hits else "none found")
-"""
-        return _run_child(script, timeout=100)
     except Exception as e:
         return f"scan failed: {e}"
+
+    # Leave ~30s of the remaining time for the child to save its cache and for the
+    # agent to still act on the result, rather than scanning right up to the wire.
+    budget = max(10, min(PDF_SCAN_BUDGET, _time_left(PDF_SCAN_BUDGET) - 30))
+
+    script = _PDF_SCAN_SCRIPT
+    script = script.replace("__PDF_PATH__", repr(str(path)))
+    script = script.replace("__KEYWORD__", repr(keyword.lower()))
+    script = script.replace("__BUDGET__", str(budget))
+    return _run_child(script, timeout=budget + 30)
 
 
 def tool_run_python(code: str) -> str:
     """Run Python in a subprocess. Whatever you print() comes back to you."""
+    budget = min(120, _time_left(120))
     try:
         proc = subprocess.run(
             [sys.executable, "-c", code],
-            capture_output=True, text=True, timeout=120, cwd="/tmp",
+            capture_output=True, text=True, timeout=budget, cwd="/tmp",
             preexec_fn=_limit_child_memory,
         )
         out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
@@ -368,7 +514,8 @@ def tool_run_python(code: str) -> str:
                     f"with pandas' chunksize, or select fewer columns]")
         return out.strip()[:15000] or "(no output - remember to print())"
     except subprocess.TimeoutExpired:
-        return "code timed out after 120s"
+        return (f"code timed out after {budget}s. If you were scanning a large PDF, "
+                f"use find_pdf_pages instead - it caches progress and returns partial results.")
     except Exception as e:
         return f"execution failed: {e}"
 
@@ -493,6 +640,11 @@ Rules:
   downloads from a previous call are GONE. Every snippet must import what it needs.
 - NEVER download the same file twice. Use download_file once - it saves to /tmp and
   files there DO persist between run_python calls - then open it by path.
+- NEVER loop over every page of a large PDF inside run_python. On a 500+ page
+  report that hits the 120s timeout and returns you NOTHING - pure wasted time.
+  Use find_pdf_pages instead: it works to a time budget, caches its progress, and
+  always returns partial results. If it says NOT FINISHED, just call it again with
+  the same url to continue where it stopped.
 - For a big PDF: download_file it ONCE, then reuse it by passing the SAME url or the
   local path it gives you back to find_pdf_pages / fetch_url - never re-download.
   Use find_pdf_pages to find which pages mention the state/table/keyword you need,
@@ -506,6 +658,14 @@ Rules:
   These are usually a few pages and often already have the exact state-wise
   breakdown you're looking for. Only fall back to the full annual report if
   nothing smaller has the answer.
+- Search is for LOCATING a document, not for reading its content. As soon as a
+  search result gives you a plausible official PDF/document link, stop searching
+  and open it - do not run several more searches "to confirm" a link you already have.
+  You have a limited number of searches per question; spend them on finding new
+  leads, not rephrasing the same query.
+- Do not rely on "site:domain.com" search filters - this search tool does not
+  reliably support them and can return unrelated results. Use plain keyword
+  searches instead, and look for official domains in the results yourself.
 - Government PDFs are sometimes bilingual (Hindi followed by English, or vice
   versa). If your keyword search matches too many pages or none, try the
   English name/spelling and check whether the document has a separate English
@@ -543,6 +703,7 @@ def run_agent(question: str, log: RunLog):
     log.write("question", text=question)
     started = time.time()
     deadline = started + TIME_BUDGET
+    _ctx.deadline = deadline  # tools clamp their own timeouts against this
 
     # Code-enforced guardrail: don't let the agent answer a question it went
     # searching for using ONLY search snippets. Search results routinely
@@ -555,6 +716,10 @@ def run_agent(question: str, log: RunLog):
     submit_blocks = 0
     MAX_SUBMIT_BLOCKS = 2  # don't loop forever if the model can't find a working source
 
+    search_calls = 0
+    SEARCH_CALL_LIMIT = int(os.environ.get("SEARCH_CALL_LIMIT", 6))
+    candidate_urls: list[str] = []
+
     for step in range(MAX_STEPS):
         out_of_time = time.time() > deadline
         if out_of_time:
@@ -564,13 +729,33 @@ def run_agent(question: str, log: RunLog):
         t0 = time.time()
         resp = llm(messages, log, step, deadline)
         msg = resp.choices[0].message
-        messages.append(msg.model_dump(exclude_none=True))
+
+        # The model's actual thinking trace, if the provider returned one. This is
+        # NOT the same thing as msg.content (which is just the text it wrote next to
+        # its tool call, and is usually empty). Kept separate so the log tells you
+        # honestly whether reasoning happened.
+        thinking = getattr(msg, "reasoning", None)
+        if thinking is None and getattr(msg, "model_extra", None):
+            thinking = msg.model_extra.get("reasoning")
+
+        dumped = msg.model_dump(exclude_none=True)
+        # Don't echo provider-specific reasoning fields back in the next request -
+        # some providers reject unknown fields on input.
+        for k in ("reasoning", "reasoning_details"):
+            dumped.pop(k, None)
+        messages.append(dumped)
+
         usage = getattr(resp, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning_tokens = getattr(details, "reasoning_tokens", None)
+
         log.write("model_turn", step=step,
                   seconds=round(time.time() - t0, 2),
                   prompt_tokens=getattr(usage, "prompt_tokens", None),
                   completion_tokens=getattr(usage, "completion_tokens", None),
-                  reasoning=(msg.content or "")[:2000],
+                  reasoning_tokens=reasoning_tokens,
+                  thinking=(str(thinking)[:2000] if thinking else None),
+                  content=(msg.content or "")[:2000],
                   tool_calls=[tc.function.name for tc in (msg.tool_calls or [])])
 
         if not msg.tool_calls:
@@ -613,10 +798,26 @@ def run_agent(question: str, log: RunLog):
                 continue
 
             if name == "search_web":
+                if search_calls >= SEARCH_CALL_LIMIT and candidate_urls:
+                    log.write("search_blocked", step=step, calls_used=search_calls,
+                              candidates=candidate_urls[:5])
+                    hint = "\n".join(f"- {u}" for u in candidate_urls[:5])
+                    messages.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": f"Not run: you've already used {search_calls} "
+                                     f"searches and have promising official links from earlier "
+                                     f"results. Stop searching and open one of these directly "
+                                     f"with download_file or fetch_url instead:\n{hint}"})
+                    continue
+                search_calls += 1
                 used_search = True
 
             t1 = time.time()
             result = call_tool(name, args, log, step)
+
+            if name == "search_web":
+                for u in _extract_candidate_urls(str(result)):
+                    if u not in candidate_urls:
+                        candidate_urls.append(u)
 
             if name in ("fetch_url", "download_file", "find_pdf_pages"):
                 failed = str(result).lower().startswith(
@@ -629,6 +830,25 @@ def run_agent(question: str, log: RunLog):
                       chars=len(str(result)),
                       result=str(result)[:4000])
             messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
+
+    if used_real_source:
+        log.write("give_up_retry", reason="step limit reached but a real source was opened")
+        messages.append({"role": "user",
+                         "content": "You are out of steps. Call submit_answer NOW with your "
+                         "best answer based on whatever you have already read. No more tools."})
+        try:
+            resp = llm(messages, log, MAX_STEPS, deadline)
+            msg = resp.choices[0].message
+            if msg.tool_calls:
+                for call in msg.tool_calls:
+                    if call.function.name == "submit_answer":
+                        args = json.loads(call.function.arguments or "{}")
+                        raw = args.get("answer_json", "")
+                        answer = unwrap(coerce_json(raw))
+                        log.write("submit_answer", raw=raw, parsed=answer, forced=True)
+                        return answer
+        except Exception as e:
+            log.write("give_up_retry_failed", error=str(e))
 
     log.write("give_up", reason="step limit reached")
     return {"error": "could not determine answer"}
