@@ -8,6 +8,7 @@ One process that does three things:
 
 Run locally: python bot.py
 """
+import asyncio
 import base64
 import os
 import re
@@ -48,6 +49,13 @@ PORT = int(os.environ.get("PORT", 8000))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO")  # e.g. "avi/tds-telegram-bot"
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+
+# MoSPI's official government-data MCP server (eSankhyiki). Gives the agent
+# real numbers straight from api.mospi.gov.in for 25 datasets (PLFS, CPI, IIP,
+# NAS, RBI, Census-adjacent stats, etc.) instead of it having to search for and
+# parse the underlying PDF report. Needs `pip install fastmcp` in your env.
+MOSPI_MCP_URL = os.environ.get("MOSPI_MCP_URL", "https://mcp.mospi.gov.in/")
+MOSPI_TIMEOUT = int(os.environ.get("MOSPI_TIMEOUT", 45))
 
 # Memory guards - the free tier gives us 512MB for everything.
 # MAX_DOWNLOAD_MB should be set to 60 in your .env - real government PDFs
@@ -364,6 +372,73 @@ def tool_search_web(query) -> str:
                 f"[best of a bad set - {label}]\n{result}")
     except Exception as e:
         return f"search failed: {e}"
+
+
+# MoSPI is a remote MCP server (a different kind of tool than the others here -
+# it's a live RPC call, not a file/page fetch), so it gets its own small client
+# instead of going through _cached_download. Kept ordered by the server's own
+# required workflow: list_datasets -> get_indicators -> get_metadata -> get_data.
+_MOSPI_STEPS = ("list_datasets", "get_indicators", "get_metadata", "get_data")
+# Repeating the exact same step+args later in the same run (or a later run,
+# while this process is alive) is free - list_datasets/get_indicators/get_metadata
+# barely ever change within a conversation, and re-asking wastes a network round trip.
+_MOSPI_CACHE: dict[str, str] = {}
+
+
+def _stringify_mcp_result(result) -> str:
+    """fastmcp's call_tool() returns a CallToolResult object, not a plain string.
+    Prefer its parsed structured data (.data) since that's clean JSON; fall back
+    to the raw text content blocks; fall back to str() so we never return nothing."""
+    try:
+        data = getattr(result, "data", None)
+        if data is not None:
+            return json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        pass
+    try:
+        for block in (getattr(result, "content", None) or []):
+            t = getattr(block, "text", None)
+            if t:
+                return t
+    except Exception:
+        pass
+    return str(result)
+
+
+def tool_query_mospi(tool: str, args: dict = None) -> str:
+    """Call one step of MoSPI's official government-data MCP server. `tool` must
+    be one of list_datasets / get_indicators / get_metadata / get_data, called
+    in that order for a new dataset+indicator - see the system prompt for the
+    full workflow and known-good codes. `args` is the parameter dict for that
+    step, e.g. {"dataset": "PLFS"}."""
+    tool = str(tool or "").strip()
+    if tool not in _MOSPI_STEPS:
+        return (f"mospi error: '{tool}' is not a valid step. Must be one of "
+                f"{', '.join(_MOSPI_STEPS)}, called in that order.")
+    args = dict(args or {})
+
+    cache_key = tool + "|" + json.dumps(args, sort_keys=True, default=str)
+    cached = _MOSPI_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    async def _call():
+        from fastmcp import Client
+        async with Client(MOSPI_MCP_URL) as c:
+            return await c.call_tool(tool, args)
+
+    timeout = max(10, min(MOSPI_TIMEOUT, _time_left(MOSPI_TIMEOUT)))
+    try:
+        result = asyncio.run(asyncio.wait_for(_call(), timeout=timeout))
+    except asyncio.TimeoutError:
+        return ("mospi error: the MoSPI server timed out. Try again once, or fall "
+                "back to search_web + the primary PDF/CSV for this question.")
+    except Exception as e:
+        return f"mospi error: {type(e).__name__}: {e}"
+
+    text = _stringify_mcp_result(result)[:8000]
+    _MOSPI_CACHE[cache_key] = text
+    return text
 
 
 DOWNLOAD_DIR = Path("/tmp/downloads")
@@ -774,6 +849,25 @@ TOOL_SCHEMA = [
             "reason": {"type": "string", "description": "one line: why you are doing this"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
+        "name": "query_mospi",
+        "description": ("Query MoSPI's official Indian government-statistics MCP server "
+                        "directly (PLFS, CPI, IIP, ASI, NAS, WPI, RBI, and 19 more datasets - "
+                        "jobs, inflation, GDP, industry, trade, etc). Returns real numbers "
+                        "straight from the source API - prefer this over search_web/PDFs "
+                        "whenever the question matches one of its datasets. "
+                        "Must be called as 4 steps IN ORDER for a new dataset+indicator: "
+                        "list_datasets -> get_indicators -> get_metadata -> get_data. "
+                        "Never skip get_metadata - it returns the valid filter codes "
+                        "(state, year, age group, etc); guessing codes silently returns "
+                        "the wrong row instead of an error."),
+        "parameters": {"type": "object", "properties": {
+            "tool": {"type": "string",
+                     "enum": ["list_datasets", "get_indicators", "get_metadata", "get_data"]},
+            "args": {"type": "object",
+                     "description": "arguments for that step, e.g. {\"dataset\": \"PLFS\"} "
+                                   "or, for get_data, {\"dataset\": ..., \"filters\": {...}}"}},
+            "required": ["tool"]}}},
+    {"type": "function", "function": {
         "name": "run_python",
         "description": ("Run Python code and get whatever it prints. "
                         "pandas, numpy, requests, bs4, openpyxl, pypdf are installed. "
@@ -799,6 +893,7 @@ TOOL_FUNCS = {
     "download_file": tool_download_file,
     "fetch_url": tool_fetch_url,
     "find_pdf_pages": tool_find_pdf_pages,
+    "query_mospi": tool_query_mospi,
     "run_python": tool_run_python,
 }
 
@@ -810,6 +905,8 @@ ALIASES = {
     "fetch_url": {"urls": "url", "link": "url", "page": "pages",
                   "page_range": "pages", "page_numbers": "pages"},
     "find_pdf_pages": {"urls": "url", "link": "url", "word": "keyword", "term": "keyword"},
+    "query_mospi": {"step": "tool", "name": "tool", "method": "tool",
+                    "params": "args", "arguments": "args", "input": "args"},
     "run_python": {"python": "code", "script": "code", "source": "code",
                    "python_code": "code"},
 }
@@ -850,9 +947,40 @@ Rules:
 - Never guess a number from memory. Find the source, download it, compute with run_python.
 - Search results and news articles are NOT the source of truth - they often disagree with
   each other and with the real report. For any question about a specific report or dataset
-  (PLFS, MOSPI, RBI, Census, etc.), you must open the primary document itself with
-  find_pdf_pages / fetch_url / download_file before you can submit an answer. Search is only
-  for locating the document's URL, never for reading off the final number.
+  (PLFS, MOSPI, RBI, Census, etc.), you must open the primary source before you can submit
+  an answer - either query_mospi (see below) if it covers that dataset, or otherwise
+  find_pdf_pages / fetch_url / download_file on the primary document itself. Search is only
+  for locating a document's URL, never for reading off the final number.
+- query_mospi is the PREFERRED source for anything covered by MoSPI's official data API:
+  PLFS (jobs, unemployment, wages), CPI/WPI/CPIALRL (inflation), IIP/ASI/ASUSE (industrial
+  output), NAS (GDP), RBI (trade, forex), ENERGY/MNRE (power), AISHE/UDISE/NSS75E (education),
+  GENDER, NFHS (health), ENVSTATS, HCES (consumption/poverty), EC (economic census), TUS
+  (time use), and other NSS rounds. It returns real numbers straight from the source API, so
+  it is faster and more reliable than finding and parsing the underlying PDF, and it counts
+  as a primary source for the rule above. Try it BEFORE search_web/PDFs whenever the question
+  names one of these topics; only fall back to search + PDF if query_mospi errors or doesn't
+  cover that dataset.
+  Call it as a strict 4-step sequence for any dataset+indicator you haven't already queried
+  this run - never skip a step or guess codes:
+    1. list_datasets (args {}) - lists all 25 datasets. Skip this call if you can already
+       name the dataset code from the question (e.g. PLFS = jobs/unemployment/wages,
+       CPI = retail inflation, NAS = GDP, IIP = industrial output) - saves a round trip.
+    2. get_indicators ({"dataset": "<CODE>"}) - find the numeric indicator_code for what
+       you need (e.g. Unemployment Rate).
+    3. get_metadata ({"dataset": ..., "indicator_code": ..., "frequency_code": ...}) -
+       returns the VALID filter codes (state, year, age group, sector, gender, etc.) for
+       that exact indicator. Never guess these codes yourself - wrong codes silently return
+       the wrong row instead of an error, so always confirm with get_metadata first.
+    4. get_data ({"dataset": ..., "filters": {...}}) using only codes get_metadata gave
+       you - this returns the actual numbers to compute your answer from.
+  Known-good reference for PLFS Unemployment Rate, Usual Status, age 15+, annual, all
+  genders, rural+urban combined: indicator_code=3, frequency_code=1, weekly_status_code=1,
+  age_code=1, gender_code=3, sector_code=3, education_code=0, religion_code=1,
+  social_category_code=1, year_type_code=1. Still confirm with get_metadata for any other
+  indicator or filter combination - do not assume these codes carry over.
+  query_mospi results are cached for this process, so repeating the exact same step+args is
+  free - reuse rather than re-querying. If it returns "mospi error", fall back to search_web
+  and the primary PDF/CSV as usual.
 - run_python is STATELESS. Each call is a brand new process: imports, variables and
   downloads from a previous call are GONE. Every snippet must import what it needs.
 - NEVER download the same file twice. Use download_file once - it saves to /tmp and
@@ -1067,6 +1195,10 @@ def run_agent(question: str, log: RunLog):
                 failed = str(result).lower().startswith(
                     ("fetch failed", "download failed", "scan failed"))
                 if not failed:
+                    used_real_source = True
+
+            if name == "query_mospi":
+                if not str(result).lower().startswith("mospi error"):
                     used_real_source = True
 
             log.write("tool_result", step=step, tool=name,
