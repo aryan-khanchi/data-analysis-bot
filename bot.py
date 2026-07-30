@@ -24,6 +24,7 @@ import queue
 import subprocess
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, send_from_directory, jsonify
@@ -108,9 +109,34 @@ STALE_AFTER = 300  # matches collect.py's default timeout_seconds (300). A messa
                    # land our answer inside the NEXT question's conversation.
 
 
-OFFICIAL_DOMAINS = ("mospi.gov.in", "pib.gov.in", "data.gov.in", "sansad.in",
-                    "rbi.org.in", "censusindia.gov.in", "esankhyiki.mospi.gov.in",
-                    "microdata.gov.in", "dge.gov.in")
+OFFICIAL_DOMAINS = (
+    # Indian government - primary sources
+    "mospi.gov.in", "esankhyiki.mospi.gov.in", "pib.gov.in", "data.gov.in",
+    "sansad.in", "rbi.org.in", "censusindia.gov.in", "microdata.gov.in",
+    "dge.gov.in", "labour.gov.in", "ncrb.gov.in", "niti.gov.in",
+    "indiabudget.gov.in", "education.gov.in", "epfindia.gov.in", "mha.gov.in",
+    # International / multilateral - reliable for cross-checking Indian stats
+    "worldbank.org", "imf.org", "ilo.org",
+    # Non-partisan Indian policy/research bodies - citation-grade summaries
+    "prsindia.org", "epw.in", "ideasforindia.in",
+    # A small set of reputable Indian business/economics dailies, for
+    # LOCATING a report and context only - the "open the primary source"
+    # rule still applies before any number from these is used.
+    "livemint.com", "business-standard.com", "thehindu.com", "indianexpress.com",
+)
+
+
+def _is_trusted_domain(url: str) -> bool:
+    """True if `url` is on (or a subdomain of) our curated allow-list. Search
+    results are filtered down to this BEFORE they're ever shown to the agent -
+    junk from random blogs/forums/aggregators never gets a chance to be read
+    as fact, and we don't waste a turn on the agent noticing it's garbage."""
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    host = host.split("@")[-1].split(":")[0]  # strip userinfo/port, defensive
+    return any(host == d or host.endswith("." + d) for d in OFFICIAL_DOMAINS)
 
 
 def _extract_candidate_urls(text: str) -> list[str]:
@@ -245,11 +271,6 @@ def _strip_search_operators(q: str) -> str:
     return re.sub(r"\s+", " ", q).strip()
 
 
-def _query_terms(q: str) -> set:
-    return {w for w in re.findall(r"[a-z0-9\-]{4,}", q.lower())
-            if w not in _SEARCH_STOPWORDS}
-
-
 def _distinctive_terms(q: str, limit: int = 6) -> list:
     """Pick the terms most worth keeping when simplifying a failed query.
 
@@ -275,35 +296,25 @@ def _distinctive_terms(q: str, limit: int = 6) -> list:
     return (acronyms + numeric + rest)[:limit]
 
 
-def _relevance(query: str, results: str) -> float:
-    """Fraction of the query's distinctive terms that appear anywhere in the
-    results. Near zero means the backend returned something unrelated -
-    e.g. Dropbox blog posts for a PLFS query, which really happens."""
-    terms = _query_terms(query)
-    if not terms:
-        return 1.0
-    low = results.lower()
-    return sum(1 for t in terms if t in low) / len(terms)
-
-
-SEARCH_RELEVANCE_FLOOR = float(os.environ.get("SEARCH_RELEVANCE_FLOOR", 0.4))
-
-# ddgs can query several independent engines. The default is backend="auto",
-# which picks for us - and when its pick returns junk there is no second opinion.
-# Naming engines explicitly lets us retry on a DIFFERENT one, which is far more
-# effective than rewording a query for an engine that is having a bad day.
-# Available (ddgs text): brave, duckduckgo, google, mojeek, startpage, yahoo,
-# yandex, wikipedia, grokipedia.
 SEARCH_BACKENDS = [b.strip() for b in os.environ.get(
     "SEARCH_BACKENDS", "duckduckgo,google,brave,mojeek").split(",") if b.strip()]
 
 OFF_TOPIC_MARKER = "[OFF-TOPIC RESULTS]"
 
+# How many trusted-domain hits to keep per query, after filtering. Pulling more
+# raw hits than this from ddgs first (see MAX_RAW_HITS) gives the filter enough
+# to work with even when most of a page of results is off-list.
+MAX_TRUSTED_HITS = 8
+MAX_RAW_HITS = 15
 
-def _ddg(queries, backend=None) -> str:
+
+def _ddg_hits(queries, backend=None) -> list:
+    """Return [(query, [hit, ...]), ...] - the RAW hits, unfiltered. Filtering
+    by trusted domain happens one level up, in tool_search_web, so every
+    caller sees the same gate."""
     from ddgs import DDGS
     out = []
-    kwargs = {"max_results": 8}
+    kwargs = {"max_results": MAX_RAW_HITS}
     if backend:
         kwargs["backend"] = backend
     with DDGS() as ddg:
@@ -312,32 +323,39 @@ def _ddg(queries, backend=None) -> str:
                 hits = list(ddg.text(str(q), **kwargs))
             except TypeError:
                 # older/newer ddgs without the backend kwarg - don't lose the search
-                hits = list(ddg.text(str(q), max_results=8))
-            out.append(f"### results for: {q}")
-            if hits:
-                out.extend(f"- {h.get('title')}\n  {h.get('href')}\n  {h.get('body','')[:300]}"
-                           for h in hits)
-            else:
-                out.append("(no results)")
-    return "\n".join(out)
+                hits = list(ddg.text(str(q), max_results=MAX_RAW_HITS))
+            out.append((q, hits))
+    return out
+
+
+def _format_hits(query: str, hits: list) -> str:
+    lines = [f"### results for: {query}"]
+    if hits:
+        lines.extend(f"- {h.get('title')}\n  {h.get('href')}\n  {h.get('body','')[:300]}"
+                     for h in hits)
+    else:
+        lines.append("(no results from a trusted source for this query)")
+    return "\n".join(lines)
 
 
 def tool_search_web(query) -> str:
     """Search the web. Accepts one query or a list of them.
 
-    This backend intermittently returns results for a completely different
-    subject: it finds nothing for a long quoted query, then falls back to
-    matching one generic word from it. Real observed cases - 'Periodic Labour
-    Force Survey' returned the periodic table, 'Annual Report PLFS' returned
-    dictionary entries for 'annual', and a PLFS query returned Dropbox blog
-    posts. So we score every result set against the query and, when it looks
-    off-topic, retry on a different engine with a simplified query before
-    handing anything back."""
+    Results are filtered down to a curated allow-list of official/institutional
+    domains (see OFFICIAL_DOMAINS) BEFORE they are returned - not as an
+    afterthought once the search budget is already spent. This backend
+    (ddgs) intermittently returns results for a completely different subject
+    for real government-data queries (speed-test sites, forum posts, unrelated
+    blogs have all been observed) and no keyword-overlap heuristic reliably
+    catches that; restricting to known-good domains does, and it also means
+    nothing ever gets read as fact from a source we can't vouch for. If a
+    query genuinely has no trusted-domain hit, we retry on a different engine
+    with a simplified query before giving up - same as before."""
     queries = query if isinstance(query, list) else [query]
     cleaned = [_strip_search_operators(str(q)) or str(q) for q in queries]
     joined = " ".join(cleaned)
 
-    attempts = []
+    attempts = 0
     try:
         for i, backend in enumerate([None] + SEARCH_BACKENDS):
             # Each backend is a fresh network round trip (2-5s). Don't keep
@@ -354,47 +372,115 @@ def tool_search_web(query) -> str:
                 qs = [" ".join(terms)] if terms else cleaned
                 label = f"backend={backend}, simplified to '{qs[0]}'"
 
-            result = _ddg(qs, backend=backend)
-            score = _relevance(joined, result)
-            attempts.append((score, label, result))
-            if score >= SEARCH_RELEVANCE_FLOOR:
+            attempts += 1
+            raw = _ddg_hits(qs, backend=backend)
+            blocks, kept_any = [], False
+            for q, hits in raw:
+                trusted = [h for h in hits if _is_trusted_domain(h.get("href", ""))]
+                trusted = trusted[:MAX_TRUSTED_HITS]
+                if trusted:
+                    kept_any = True
+                blocks.append(_format_hits(q, trusted))
+            result = "\n".join(blocks)
+
+            if kept_any:
                 if i == 0:
                     return result
-                return f"[first attempt was off-topic; retried: {label}]\n{result}"
+                return f"[first attempt had nothing from a trusted source; retried: {label}]\n{result}"
 
-        # Nothing cleared the bar - hand back the least-bad set, clearly flagged.
-        score, label, result = max(attempts, key=lambda a: a[0])
-        return (f"{OFF_TOPIC_MARKER} Tried {len(attempts)} engines; none returned "
-                f"results matching your query (best relevance {score:.2f}). This is a "
-                f"backend fault, not your wording. DO NOT read any fact out of the "
-                f"text below. Either open a source URL you already have, or try "
-                f"plain keywords with no quotes and no site: filters.\n"
-                f"[best of a bad set - {label}]\n{result}")
+        # No backend/query produced a single trusted-domain hit.
+        return (f"{OFF_TOPIC_MARKER} Tried {attempts} engine(s)/query variant(s); none "
+                f"returned a result from a trusted official/institutional source. "
+                f"Off-list results are not shown here - they're unreliable for this "
+                f"bot's purposes. Try different, more specific keywords (exact report "
+                f"name, ministry, ministry acronym, year), or open a URL you already have.")
     except Exception as e:
         return f"search failed: {e}"
 
 
-# MoSPI is a remote MCP server (a different kind of tool than the others here -
-# it's a live RPC call, not a file/page fetch), so it gets its own small client
-# instead of going through _cached_download. Kept ordered by the server's own
-# required workflow: list_datasets -> get_indicators -> get_metadata -> get_data.
-_MOSPI_STEPS = ("list_datasets", "get_indicators", "get_metadata", "get_data")
-# Repeating the exact same step+args later in the same run (or a later run,
-# while this process is alive) is free - list_datasets/get_indicators/get_metadata
-# barely ever change within a conversation, and re-asking wastes a network round trip.
+# MoSPI is a remote MCP server (a live RPC call, not a file/page fetch), so it
+# gets its own small client instead of going through _cached_download.
+#
+# This is exposed as 4 SEPARATE tools (one per required workflow step) rather
+# than one generic "tool name + args dict" wrapper. The generic version left
+# the model guessing the argument SHAPE for each step (does "dataset" go at
+# the top level or inside a nested dict? is it "filters" or "args"?) and it
+# took 4-5 failed calls in testing to land on the right shape by trial and
+# error. Giving each step its own explicit, required parameters makes the
+# shape part of the function-calling schema itself, which the model can't get
+# wrong the way free-form JSON invites it to.
+MOSPI_TRUNCATE_CHARS = int(os.environ.get("MOSPI_TRUNCATE_CHARS", 20000))
+# Repeating the exact same step+args later in the same run is free -
+# list_datasets/get_indicators/get_metadata barely ever change within a
+# conversation, and re-asking wastes a network round trip.
 _MOSPI_CACHE: dict[str, str] = {}
 
 
-def _stringify_mcp_result(result) -> str:
-    """fastmcp's call_tool() returns a CallToolResult object, not a plain string.
-    Prefer its parsed structured data (.data) since that's clean JSON; fall back
-    to the raw text content blocks; fall back to str() so we never return nothing."""
+def _compact_records(records: list) -> str:
+    """Collapse a list of uniform dict records into a compact text table.
+
+    MoSPI's get_data returns one dict PER ROW with ~15 fields, but almost all
+    of those fields are held constant by the query's own filters (year,
+    frequency, gender, sector, age group, ...) - only 1-2 fields (typically
+    state and value) actually differ between rows. A 9-state response was
+    observed at ~2700 raw JSON characters for what is really 9 numbers. This
+    prints the shared fields ONCE and the varying fields as a small table,
+    which matters far more than it looks like it should: whatever this
+    returns gets resent in full on every later turn for the rest of the run,
+    so a 90% smaller payload here is a 90% saving repeated turn after turn."""
+    if not records or not all(isinstance(r, dict) for r in records):
+        return json.dumps(records, ensure_ascii=False, default=str)
+
+    keys, seen = [], set()
+    for r in records:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+
+    constant, varying = {}, []
+    for k in keys:
+        values = {json.dumps(r.get(k), sort_keys=True, default=str) for r in records}
+        if len(values) == 1:
+            constant[k] = records[0].get(k)
+        else:
+            varying.append(k)
+
+    lines = []
+    if constant:
+        lines.append("[same for every row below] " +
+                     ", ".join(f"{k}={v}" for k, v in constant.items()))
+    if varying:
+        lines.append(" | ".join(varying))
+        lines.extend(" | ".join(str(r.get(k)) for k in varying) for r in records)
+    else:
+        lines.append(f"(single row of {len(records)} - see fields above)")
+    return "\n".join(lines)
+
+
+def _format_mospi_result(result) -> str:
+    """Turn a fastmcp CallToolResult into text for the model. If the parsed
+    result has the shape MoSPI's get_data actually returns - a top-level
+    "data" list of uniform row-dicts - compact it with _compact_records
+    instead of dumping raw JSON. Other steps (list_datasets, get_indicators,
+    get_metadata) don't have this shape and pass through unchanged."""
     try:
         data = getattr(result, "data", None)
-        if data is not None:
-            return json.dumps(data, ensure_ascii=False, default=str)
     except Exception:
-        pass
+        data = None
+
+    if isinstance(data, dict) and isinstance(data.get("data"), list) and data["data"]:
+        out = [_compact_records(data["data"])]
+        meta = data.get("meta_data") or data.get("metadata")
+        if meta:
+            out.append(f"[meta: {json.dumps(meta, ensure_ascii=False, default=str)}]")
+        return "\n".join(out)
+
+    if data is not None:
+        try:
+            return json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            pass
     try:
         for block in (getattr(result, "content", None) or []):
             t = getattr(block, "text", None)
@@ -405,19 +491,12 @@ def _stringify_mcp_result(result) -> str:
     return str(result)
 
 
-def tool_query_mospi(tool: str, args: dict = None) -> str:
-    """Call one step of MoSPI's official government-data MCP server. `tool` must
-    be one of list_datasets / get_indicators / get_metadata / get_data, called
-    in that order for a new dataset+indicator - see the system prompt for the
-    full workflow and known-good codes. `args` is the parameter dict for that
-    step, e.g. {"dataset": "PLFS"}."""
-    tool = str(tool or "").strip()
-    if tool not in _MOSPI_STEPS:
-        return (f"mospi error: '{tool}' is not a valid step. Must be one of "
-                f"{', '.join(_MOSPI_STEPS)}, called in that order.")
+def _mospi_call(step: str, args: dict) -> str:
+    """Shared plumbing for the 4 typed MoSPI tools below: caching, timeout
+    handling, and the actual MCP call. Not exposed to the model directly -
+    each typed wrapper builds `args` in the exact shape that step needs."""
     args = dict(args or {})
-
-    cache_key = tool + "|" + json.dumps(args, sort_keys=True, default=str)
+    cache_key = step + "|" + json.dumps(args, sort_keys=True, default=str)
     cached = _MOSPI_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -425,7 +504,7 @@ def tool_query_mospi(tool: str, args: dict = None) -> str:
     async def _call():
         from fastmcp import Client
         async with Client(MOSPI_MCP_URL) as c:
-            return await c.call_tool(tool, args)
+            return await c.call_tool(step, args)
 
     timeout = max(10, min(MOSPI_TIMEOUT, _time_left(MOSPI_TIMEOUT)))
     try:
@@ -436,9 +515,60 @@ def tool_query_mospi(tool: str, args: dict = None) -> str:
     except Exception as e:
         return f"mospi error: {type(e).__name__}: {e}"
 
-    text = _stringify_mcp_result(result)[:8000]
+    text = _format_mospi_result(result)
+    if len(text) > MOSPI_TRUNCATE_CHARS:
+        # A SILENT cutoff here is what let the agent invent numbers for the
+        # states/rows it never actually received in one observed run. Making
+        # the cutoff visible and actionable stops that: the agent is told
+        # exactly what happened and what to do about it, instead of a normal-
+        # looking response that just happens to stop partway through a record.
+        shown = text[:MOSPI_TRUNCATE_CHARS]
+        text = (f"{shown}\n\n[TRUNCATED - showing {MOSPI_TRUNCATE_CHARS} of "
+                f"{len(text)} characters. This is NOT the complete result - rows "
+                f"after this point were never sent to you. Do NOT fill in or guess "
+                f"the missing rows. Narrow `filters` (e.g. a shorter state_code "
+                f"list, or add more filters) and call mospi_get_data again to "
+                f"fetch the rest.]")
     _MOSPI_CACHE[cache_key] = text
     return text
+
+
+def tool_mospi_list_datasets() -> str:
+    """Step 1/4 of the MoSPI workflow. Lists all datasets MoSPI's official MCP
+    server covers (PLFS, CPI, IIP, NAS, RBI, ...). Skip this call if you can
+    already name the dataset code from the question (e.g. PLFS = jobs/
+    unemployment/wages, CPI = retail inflation, NAS = GDP)."""
+    return _mospi_call("list_datasets", {})
+
+
+def tool_mospi_get_indicators(dataset: str) -> str:
+    """Step 2/4. Lists the indicators available for one MoSPI dataset (e.g. for
+    PLFS: LFPR, WPR, UR/Unemployment Rate, wages...) with each one's
+    indicator_code and which frequency_code (Annual/Quarterly/Monthly) it's
+    available under."""
+    return _mospi_call("get_indicators", {"dataset": dataset})
+
+
+def tool_mospi_get_metadata(dataset: str, indicator_code, frequency_code=None) -> str:
+    """Step 3/4. REQUIRED before mospi_get_data - never skip this and guess
+    filter codes. Returns the VALID filter values (state, year, age group,
+    sector, gender, etc.) for one specific dataset+indicator. Wrong codes
+    silently return the wrong row instead of an error, so always confirm here
+    first, even if a filter combination worked for a different indicator."""
+    args = {"dataset": dataset, "indicator_code": indicator_code}
+    if frequency_code is not None:
+        args["frequency_code"] = frequency_code
+    return _mospi_call("get_metadata", args)
+
+
+def tool_mospi_get_data(dataset: str, filters: dict) -> str:
+    """Step 4/4. Fetches the actual numbers. `filters` must be a FLAT dict
+    using only the codes mospi_get_metadata returned for this exact
+    dataset+indicator (e.g. {"indicator_code": 3, "frequency_code": 1,
+    "year": "2023-24", "state_code": "1,2,3", ...}). If the result comes back
+    TRUNCATED, narrow `filters` (e.g. fewer states at a time) and call this
+    again for the rest - never guess the missing rows."""
+    return _mospi_call("get_data", {"dataset": dataset, "filters": dict(filters or {})})
 
 
 DOWNLOAD_DIR = Path("/tmp/downloads")
@@ -849,24 +979,46 @@ TOOL_SCHEMA = [
             "reason": {"type": "string", "description": "one line: why you are doing this"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
-        "name": "query_mospi",
-        "description": ("Query MoSPI's official Indian government-statistics MCP server "
-                        "directly (PLFS, CPI, IIP, ASI, NAS, WPI, RBI, and 19 more datasets - "
-                        "jobs, inflation, GDP, industry, trade, etc). Returns real numbers "
-                        "straight from the source API - prefer this over search_web/PDFs "
-                        "whenever the question matches one of its datasets. "
-                        "Must be called as 4 steps IN ORDER for a new dataset+indicator: "
-                        "list_datasets -> get_indicators -> get_metadata -> get_data. "
-                        "Never skip get_metadata - it returns the valid filter codes "
-                        "(state, year, age group, etc); guessing codes silently returns "
-                        "the wrong row instead of an error."),
+        "name": "mospi_list_datasets",
+        "description": ("Step 1/4 of MoSPI's official Indian government-statistics MCP "
+                        "server (PLFS, CPI, IIP, ASI, NAS, WPI, RBI, and 19 more - jobs, "
+                        "inflation, GDP, industry, trade, etc). Lists all datasets it covers. "
+                        "Returns real numbers straight from the source API - prefer this "
+                        "workflow over search_web/PDFs whenever the question matches one of "
+                        "its datasets. Skip this call if you already know the dataset code."),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "mospi_get_indicators",
+        "description": ("Step 2/4. Lists the indicators available for one MoSPI dataset "
+                        "(e.g. for PLFS: LFPR, WPR, Unemployment Rate, wages) together with "
+                        "each one's indicator_code."),
         "parameters": {"type": "object", "properties": {
-            "tool": {"type": "string",
-                     "enum": ["list_datasets", "get_indicators", "get_metadata", "get_data"]},
-            "args": {"type": "object",
-                     "description": "arguments for that step, e.g. {\"dataset\": \"PLFS\"} "
-                                   "or, for get_data, {\"dataset\": ..., \"filters\": {...}}"}},
-            "required": ["tool"]}}},
+            "dataset": {"type": "string", "description": "dataset code, e.g. \"PLFS\", \"CPI\", \"NAS\""}},
+            "required": ["dataset"]}}},
+    {"type": "function", "function": {
+        "name": "mospi_get_metadata",
+        "description": ("Step 3/4, REQUIRED before mospi_get_data. Returns the VALID filter "
+                        "codes (state, year, age group, sector, gender, etc.) for one specific "
+                        "dataset+indicator. Never skip this and guess filter codes yourself - "
+                        "wrong codes silently return the wrong row instead of an error."),
+        "parameters": {"type": "object", "properties": {
+            "dataset": {"type": "string"},
+            "indicator_code": {"description": "from mospi_get_indicators"},
+            "frequency_code": {"description": "1=Annual, 2=Quarterly, 3=Monthly "
+                               "(availability is dataset-dependent)"}},
+            "required": ["dataset", "indicator_code"]}}},
+    {"type": "function", "function": {
+        "name": "mospi_get_data",
+        "description": ("Step 4/4. Fetches the actual numbers, using ONLY filter codes that "
+                        "mospi_get_metadata returned for this exact dataset+indicator. If the "
+                        "result is marked TRUNCATED, narrow `filters` (e.g. fewer states at "
+                        "once) and call this again for the rest - never guess missing rows."),
+        "parameters": {"type": "object", "properties": {
+            "dataset": {"type": "string"},
+            "filters": {"type": "object", "description": "flat dict of filter codes, e.g. "
+                        "{\"indicator_code\": 3, \"frequency_code\": 1, \"year\": \"2023-24\", "
+                        "\"state_code\": \"1,2,3\", ...}"}},
+            "required": ["dataset", "filters"]}}},
     {"type": "function", "function": {
         "name": "run_python",
         "description": ("Run Python code and get whatever it prints. "
@@ -893,7 +1045,10 @@ TOOL_FUNCS = {
     "download_file": tool_download_file,
     "fetch_url": tool_fetch_url,
     "find_pdf_pages": tool_find_pdf_pages,
-    "query_mospi": tool_query_mospi,
+    "mospi_list_datasets": tool_mospi_list_datasets,
+    "mospi_get_indicators": tool_mospi_get_indicators,
+    "mospi_get_metadata": tool_mospi_get_metadata,
+    "mospi_get_data": tool_mospi_get_data,
     "run_python": tool_run_python,
 }
 
@@ -905,8 +1060,11 @@ ALIASES = {
     "fetch_url": {"urls": "url", "link": "url", "page": "pages",
                   "page_range": "pages", "page_numbers": "pages"},
     "find_pdf_pages": {"urls": "url", "link": "url", "word": "keyword", "term": "keyword"},
-    "query_mospi": {"step": "tool", "name": "tool", "method": "tool",
-                    "params": "args", "arguments": "args", "input": "args"},
+    "mospi_get_indicators": {"dataset_code": "dataset", "product": "dataset"},
+    "mospi_get_metadata": {"dataset_code": "dataset", "product": "dataset",
+                           "indicator": "indicator_code", "frequency": "frequency_code"},
+    "mospi_get_data": {"dataset_code": "dataset", "product": "dataset",
+                       "params": "filters", "args": "filters", "query": "filters"},
     "run_python": {"python": "code", "script": "code", "source": "code",
                    "python_code": "code"},
 }
@@ -948,39 +1106,42 @@ Rules:
 - Search results and news articles are NOT the source of truth - they often disagree with
   each other and with the real report. For any question about a specific report or dataset
   (PLFS, MOSPI, RBI, Census, etc.), you must open the primary source before you can submit
-  an answer - either query_mospi (see below) if it covers that dataset, or otherwise
+  an answer - either the mospi_* tools (see below) if they cover that dataset, or otherwise
   find_pdf_pages / fetch_url / download_file on the primary document itself. Search is only
   for locating a document's URL, never for reading off the final number.
-- query_mospi is the PREFERRED source for anything covered by MoSPI's official data API:
-  PLFS (jobs, unemployment, wages), CPI/WPI/CPIALRL (inflation), IIP/ASI/ASUSE (industrial
+- The mospi_* tools are the PREFERRED source for anything covered by MoSPI's official data
+  API: PLFS (jobs, unemployment, wages), CPI/WPI/CPIALRL (inflation), IIP/ASI/ASUSE (industrial
   output), NAS (GDP), RBI (trade, forex), ENERGY/MNRE (power), AISHE/UDISE/NSS75E (education),
   GENDER, NFHS (health), ENVSTATS, HCES (consumption/poverty), EC (economic census), TUS
-  (time use), and other NSS rounds. It returns real numbers straight from the source API, so
-  it is faster and more reliable than finding and parsing the underlying PDF, and it counts
-  as a primary source for the rule above. Try it BEFORE search_web/PDFs whenever the question
-  names one of these topics; only fall back to search + PDF if query_mospi errors or doesn't
-  cover that dataset.
-  Call it as a strict 4-step sequence for any dataset+indicator you haven't already queried
+  (time use), and other NSS rounds. They return real numbers straight from the source API, so
+  they are faster and more reliable than finding and parsing the underlying PDF, and using
+  them counts as a primary source for the rule above. Try them BEFORE search_web/PDFs whenever
+  the question names one of these topics; only fall back to search + PDF if they error or
+  don't cover that dataset.
+  Call them as a strict 4-step sequence for any dataset+indicator you haven't already queried
   this run - never skip a step or guess codes:
-    1. list_datasets (args {}) - lists all 25 datasets. Skip this call if you can already
+    1. mospi_list_datasets() - lists all 25 datasets. Skip this call if you can already
        name the dataset code from the question (e.g. PLFS = jobs/unemployment/wages,
        CPI = retail inflation, NAS = GDP, IIP = industrial output) - saves a round trip.
-    2. get_indicators ({"dataset": "<CODE>"}) - find the numeric indicator_code for what
+    2. mospi_get_indicators(dataset="<CODE>") - find the numeric indicator_code for what
        you need (e.g. Unemployment Rate).
-    3. get_metadata ({"dataset": ..., "indicator_code": ..., "frequency_code": ...}) -
-       returns the VALID filter codes (state, year, age group, sector, gender, etc.) for
-       that exact indicator. Never guess these codes yourself - wrong codes silently return
-       the wrong row instead of an error, so always confirm with get_metadata first.
-    4. get_data ({"dataset": ..., "filters": {...}}) using only codes get_metadata gave
+    3. mospi_get_metadata(dataset=..., indicator_code=..., frequency_code=...) - returns
+       the VALID filter codes (state, year, age group, sector, gender, etc.) for that exact
+       indicator. Never guess these codes yourself - wrong codes silently return the wrong
+       row instead of an error, so always confirm with mospi_get_metadata first.
+    4. mospi_get_data(dataset=..., filters={...}) using only codes mospi_get_metadata gave
        you - this returns the actual numbers to compute your answer from.
   Known-good reference for PLFS Unemployment Rate, Usual Status, age 15+, annual, all
   genders, rural+urban combined: indicator_code=3, frequency_code=1, weekly_status_code=1,
   age_code=1, gender_code=3, sector_code=3, education_code=0, religion_code=1,
-  social_category_code=1, year_type_code=1. Still confirm with get_metadata for any other
-  indicator or filter combination - do not assume these codes carry over.
-  query_mospi results are cached for this process, so repeating the exact same step+args is
-  free - reuse rather than re-querying. If it returns "mospi error", fall back to search_web
-  and the primary PDF/CSV as usual.
+  social_category_code=1, year_type_code=1. Still confirm with mospi_get_metadata for any
+  other indicator or filter combination - do not assume these codes carry over.
+  If mospi_get_data comes back marked TRUNCATED, that means some rows were NOT included -
+  do not fill them in from memory or assume a pattern. Narrow `filters` (e.g. a shorter
+  state_code list) and call mospi_get_data again for the missing rows.
+  Results are cached for this process, so repeating the exact same call is free - reuse
+  rather than re-querying. If a call returns "mospi error", fall back to search_web and the
+  primary PDF/CSV as usual.
 - run_python is STATELESS. Each call is a brand new process: imports, variables and
   downloads from a previous call are GONE. Every snippet must import what it needs.
 - NEVER download the same file twice. Use download_file once - it saves to /tmp and
@@ -1013,15 +1174,19 @@ Rules:
   and open it - do not run several more searches "to confirm" a link you already have.
   You have a limited number of searches per question; spend them on finding new
   leads, not rephrasing the same query.
-- Do not rely on "site:domain.com" search filters - this search tool does not
-  reliably support them and can return unrelated results. Use plain keyword
-  searches instead, and look for official domains in the results yourself.
+- search_web results are already restricted to a curated list of official/institutional
+  domains (government ministries, RBI, multilateral bodies, non-partisan policy research,
+  a few vetted business dailies) - you do NOT need to check or filter them yourself, and
+  nothing outside that list is ever shown to you. If a search comes back saying nothing
+  trusted was found, that's a real "nothing useful here" signal, not a filtering error -
+  try different, more specific keywords (exact report name, ministry, acronym, year) rather
+  than assuming the tool missed something.
+- "site:domain.com" search filters are stripped automatically before searching, since this
+  backend doesn't reliably honour them - use plain keyword searches instead.
 - Government PDFs are sometimes bilingual (Hindi followed by English, or vice
   versa). If your keyword search matches too many pages or none, try the
   English name/spelling and check whether the document has a separate English
   section rather than scanning the whole thing indiscriminately.
-- Prefer official sources (mospi.gov.in, pib.gov.in, sansad.in, data.gov.in, RBI,
-  Census, World Bank, etc.).
 - If data is embedded in the question itself, just compute on it directly - no need to search
   or open any document.
 - Read the question's JSON template carefully. Your answer must match that shape EXACTLY:
@@ -1033,12 +1198,23 @@ Rules:
   whole envelope, and never a "log_url" key.
 - Earlier messages are context only. If a question refers to data given "at the start",
   it means the start of THIS exchange - never data from an older, unrelated question.
-- Work efficiently. Every tool call costs a round trip, so do not use run_python for
-  trivial arithmetic you can do reliably in your head. Use it for real data work:
-  parsing files, aggregating rows, sorting, statistics.
-- Batch your work: if you need three numbers from one file, get them in one run_python
-  call, not three.
-- Do not re-verify an answer you are already confident in.
+- Minimize the number of TURNS, not just tool calls - every turn resends this entire
+  conversation so far (system prompt, every previous tool call and result) back to you as
+  input. A run that takes 6 turns costs far less than double a 3-turn run, not just double -
+  needless turns are the single most expensive mistake you can make here, more costly than
+  any individual tool call.
+- Before your first tool call, mentally plan the full sequence this question needs (e.g. for
+  a MoSPI question: mospi_get_indicators -> mospi_get_metadata -> mospi_get_data ->
+  submit_answer) and follow that plan, rather than exploring one step at a time and deciding
+  what's next only after each result comes back.
+- Once you have ONE number from a primary source (mospi_* tools, or an opened PDF/CSV) that
+  fully answers the question, call submit_answer immediately. Do not run additional searches,
+  re-fetch the same data, or open a second source "to confirm" an answer you already trust -
+  this doesn't improve correctness, it only adds turns you're paying for.
+- Work efficiently within a turn too: do not use run_python for trivial arithmetic you can do
+  reliably in your head. Use it for real data work: parsing files, aggregating rows, sorting,
+  statistics. If you need three numbers from one file, get them in one run_python call, not
+  three.
 - When you are confident, call submit_answer once. That ends the run.
 """
 
@@ -1197,7 +1373,7 @@ def run_agent(question: str, log: RunLog):
                 if not failed:
                     used_real_source = True
 
-            if name == "query_mospi":
+            if name.startswith("mospi_"):
                 if not str(result).lower().startswith("mospi error"):
                     used_real_source = True
 
