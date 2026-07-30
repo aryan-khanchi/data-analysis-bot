@@ -67,7 +67,11 @@ LOG_DIR.mkdir(exist_ok=True)
 # TIME_BUDGET - start with "low".
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "").strip().lower()
 
-MAX_STEPS = int(os.environ.get("MAX_STEPS", 24))  # search is now capped separately
+MAX_STEPS = int(os.environ.get("MAX_STEPS", 34))
+# Raised because runs now finish well inside TIME_BUDGET and hit this limit
+# instead: a run that used only 100s of 240s still exhausted 24 steps. Every
+# tool call is clamped to the remaining time (see _time_left), so a bigger step
+# budget cannot push the run past the deadline - the deadline still governs.
                                                    # (SEARCH_CALL_LIMIT), so most of this
                                                    # budget should go toward actually reading
                                                    # documents rather than re-searching
@@ -216,19 +220,148 @@ class RunLog:
 # --------------------------------------------------------------------------
 # TOOLS - the actions the agent is allowed to take
 # --------------------------------------------------------------------------
-def tool_search_web(query) -> str:
-    """Search the web. Accepts one query or a list of them."""
-    queries = query if isinstance(query, list) else [query]
+_SEARCH_STOPWORDS = {
+    "what", "which", "where", "when", "with", "from", "that", "this", "have",
+    "does", "the", "and", "for", "was", "were", "site", "filetype", "http",
+    "https", "www", "com", "org", "pdf", "html",
+}
+
+
+def _strip_search_operators(q: str) -> str:
+    """This search backend does not honour site:/filetype: and returns unrelated
+    junk when they're used. The system prompt says not to use them; the model
+    does anyway, so strip them here."""
+    q = re.sub(r"\b(?:site|filetype|inurl|intitle)\s*:\s*\S+", " ", q, flags=re.I)
+    q = re.sub(r"\bOR\b", " ", q)
+    q = q.replace('"', " ")
+    return re.sub(r"\s+", " ", q).strip()
+
+
+def _query_terms(q: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9\-]{4,}", q.lower())
+            if w not in _SEARCH_STOPWORDS}
+
+
+def _distinctive_terms(q: str, limit: int = 6) -> list:
+    """Pick the terms most worth keeping when simplifying a failed query.
+
+    Ordering by LENGTH is wrong: it throws away exactly the terms that identify
+    the subject. For 'Periodic Labour Force Survey Annual Report 2023-24' the
+    longest words are periodic/labour/survey/report - all generic - while the
+    single most identifying token, PLFS, is only 4 characters and gets dropped.
+    So: acronyms first (they were capitalised in the original), then tokens
+    carrying digits (years, table numbers), then everything else, each group in
+    the order the model wrote them."""
+    acronyms, numeric, rest, seen = [], [], [], set()
+    for raw in re.findall(r"[A-Za-z0-9\-]{3,}", q):
+        low = raw.lower()
+        if low in _SEARCH_STOPWORDS or low in seen:
+            continue
+        seen.add(low)
+        if raw.isupper() and raw.isalpha():
+            acronyms.append(raw)
+        elif any(c.isdigit() for c in raw):
+            numeric.append(raw)
+        elif len(low) >= 4:
+            rest.append(raw)
+    return (acronyms + numeric + rest)[:limit]
+
+
+def _relevance(query: str, results: str) -> float:
+    """Fraction of the query's distinctive terms that appear anywhere in the
+    results. Near zero means the backend returned something unrelated -
+    e.g. Dropbox blog posts for a PLFS query, which really happens."""
+    terms = _query_terms(query)
+    if not terms:
+        return 1.0
+    low = results.lower()
+    return sum(1 for t in terms if t in low) / len(terms)
+
+
+SEARCH_RELEVANCE_FLOOR = float(os.environ.get("SEARCH_RELEVANCE_FLOOR", 0.4))
+
+# ddgs can query several independent engines. The default is backend="auto",
+# which picks for us - and when its pick returns junk there is no second opinion.
+# Naming engines explicitly lets us retry on a DIFFERENT one, which is far more
+# effective than rewording a query for an engine that is having a bad day.
+# Available (ddgs text): brave, duckduckgo, google, mojeek, startpage, yahoo,
+# yandex, wikipedia, grokipedia.
+SEARCH_BACKENDS = [b.strip() for b in os.environ.get(
+    "SEARCH_BACKENDS", "duckduckgo,google,brave,mojeek").split(",") if b.strip()]
+
+OFF_TOPIC_MARKER = "[OFF-TOPIC RESULTS]"
+
+
+def _ddg(queries, backend=None) -> str:
+    from ddgs import DDGS
     out = []
-    try:
-        from ddgs import DDGS
-        with DDGS() as ddg:
-            for q in queries[:3]:
+    kwargs = {"max_results": 8}
+    if backend:
+        kwargs["backend"] = backend
+    with DDGS() as ddg:
+        for q in queries[:3]:
+            try:
+                hits = list(ddg.text(str(q), **kwargs))
+            except TypeError:
+                # older/newer ddgs without the backend kwarg - don't lose the search
                 hits = list(ddg.text(str(q), max_results=8))
-                out.append(f"### results for: {q}")
+            out.append(f"### results for: {q}")
+            if hits:
                 out.extend(f"- {h.get('title')}\n  {h.get('href')}\n  {h.get('body','')[:300]}"
-                           for h in hits) if hits else out.append("(no results)")
-        return "\n".join(out)
+                           for h in hits)
+            else:
+                out.append("(no results)")
+    return "\n".join(out)
+
+
+def tool_search_web(query) -> str:
+    """Search the web. Accepts one query or a list of them.
+
+    This backend intermittently returns results for a completely different
+    subject: it finds nothing for a long quoted query, then falls back to
+    matching one generic word from it. Real observed cases - 'Periodic Labour
+    Force Survey' returned the periodic table, 'Annual Report PLFS' returned
+    dictionary entries for 'annual', and a PLFS query returned Dropbox blog
+    posts. So we score every result set against the query and, when it looks
+    off-topic, retry on a different engine with a simplified query before
+    handing anything back."""
+    queries = query if isinstance(query, list) else [query]
+    cleaned = [_strip_search_operators(str(q)) or str(q) for q in queries]
+    joined = " ".join(cleaned)
+
+    attempts = []
+    try:
+        for i, backend in enumerate([None] + SEARCH_BACKENDS):
+            # Each backend is a fresh network round trip (2-5s). Don't keep
+            # shopping for a good engine when the run is nearly out of time -
+            # hand back what we have and let the agent decide.
+            if i > 0 and _time_left() < 30:
+                break
+            # First pass: the query as written. Later passes: a different engine
+            # and, from the second retry on, a simplified query too.
+            if i == 0:
+                qs, label = cleaned, "as written"
+            else:
+                terms = _distinctive_terms(joined)
+                qs = [" ".join(terms)] if terms else cleaned
+                label = f"backend={backend}, simplified to '{qs[0]}'"
+
+            result = _ddg(qs, backend=backend)
+            score = _relevance(joined, result)
+            attempts.append((score, label, result))
+            if score >= SEARCH_RELEVANCE_FLOOR:
+                if i == 0:
+                    return result
+                return f"[first attempt was off-topic; retried: {label}]\n{result}"
+
+        # Nothing cleared the bar - hand back the least-bad set, clearly flagged.
+        score, label, result = max(attempts, key=lambda a: a[0])
+        return (f"{OFF_TOPIC_MARKER} Tried {len(attempts)} engines; none returned "
+                f"results matching your query (best relevance {score:.2f}). This is a "
+                f"backend fault, not your wording. DO NOT read any fact out of the "
+                f"text below. Either open a source URL you already have, or try "
+                f"plain keywords with no quotes and no site: filters.\n"
+                f"[best of a bad set - {label}]\n{result}")
     except Exception as e:
         return f"search failed: {e}"
 
@@ -318,6 +451,42 @@ def _limit_child_memory():
         pass
 
 
+def _child_env():
+    """Environment for child processes.
+
+    CRITICAL: we cap the child with RLIMIT_AS, which limits total VIRTUAL address
+    space. OpenBLAS (pulled in by numpy, and therefore pandas) reserves a large
+    slab of address space PER THREAD when it is imported, and blows straight
+    through a 300MB cap - failing with 'OpenBLAS error: Memory allocation still
+    failed after 10 retries' before any of our code runs. Pinning every math
+    library to a single thread keeps that reservation small enough to import.
+    Without this, pandas/openpyxl are unusable and no spreadsheet can be read."""
+    env = dict(os.environ)
+    env.update({
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+    })
+    return env
+
+
+# numpy/pandas pull in OpenBLAS, which reserves a large chunk of VIRTUAL address
+# space per worker thread on import. RLIMIT_AS caps virtual address space, so the
+# two fight and pandas dies with "OpenBLAS error: Memory allocation still failed"
+# before running a single line of the snippet. Pinning the thread pools to 1 keeps
+# the reservation small enough to fit under the cap.
+CHILD_ENV = {
+    **os.environ,
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
+
+
 def _run_child(code: str, timeout: int = 100) -> str:
     """Run `code` in its OWN process with a hard memory cap. This is what keeps
     PDF/Excel parsing from ever crashing the main bot process - a crash there
@@ -328,7 +497,7 @@ def _run_child(code: str, timeout: int = 100) -> str:
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=timeout, cwd="/tmp",
-            preexec_fn=_limit_child_memory,
+            preexec_fn=_limit_child_memory, env=_child_env(),
         )
         out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
         if "MemoryError" in out:
@@ -550,7 +719,7 @@ def tool_run_python(code: str) -> str:
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=budget, cwd="/tmp",
-            preexec_fn=_limit_child_memory,
+            preexec_fn=_limit_child_memory, env=_child_env(),
         )
         out = (proc.stdout or "") + (("\nSTDERR:\n" + proc.stderr) if proc.stderr else "")
         if proc.returncode != 0 and ("NameError" in out or "ModuleNotFoundError" in out):
@@ -773,9 +942,17 @@ def run_agent(question: str, log: RunLog):
     SEARCH_CALL_LIMIT = int(os.environ.get("SEARCH_CALL_LIMIT", 6))
     candidate_urls: list[str] = []
 
-    for step in range(MAX_STEPS):
+    empty_turns = 0
+    MAX_EMPTY_TURNS = 8  # observed 7 empty turns in a single run - null usage
+                         # fields, no tool call, no text. Charging those against
+                         # the step budget cost 29% of it.
+    warned_time_up = False
+    step = -1
+    while step + 1 < MAX_STEPS:
+        step += 1
         out_of_time = time.time() > deadline
-        if out_of_time:
+        if out_of_time and not warned_time_up:
+            warned_time_up = True  # say it once; repeating it every turn just burns context
             messages.append({"role": "user",
                              "content": "Time is up. Call submit_answer NOW with your best "
                              "answer from what you already know. No more tools."})
@@ -812,6 +989,13 @@ def run_agent(question: str, log: RunLog):
                   tool_calls=[tc.function.name for tc in (msg.tool_calls or [])])
 
         if not msg.tool_calls:
+            # A completely empty turn (no tool call, no text - it happens, and the
+            # usage fields come back null) is an API hiccup, not a decision. Don't
+            # charge it against the step budget; just nudge and retry.
+            if not (msg.content or "").strip() and empty_turns < MAX_EMPTY_TURNS:
+                empty_turns += 1
+                step -= 1
+                log.write("empty_turn", step=step, count=empty_turns)
             messages.append({"role": "user",
                              "content": "Use a tool, or call submit_answer if you are done."})
             continue
@@ -871,6 +1055,13 @@ def run_agent(question: str, log: RunLog):
                 for u in _extract_candidate_urls(str(result)):
                     if u not in candidate_urls:
                         candidate_urls.append(u)
+                if str(result).startswith(OFF_TOPIC_MARKER):
+                    # A backend fault is not the agent's fault. Don't charge it
+                    # against SEARCH_CALL_LIMIT - in one observed run 3 of 6
+                    # searches were junk, and the agent was then blocked from
+                    # searching with almost nothing usable to show for it.
+                    search_calls = max(0, search_calls - 1)
+                    log.write("search_refunded", step=step, calls_used=search_calls)
 
             if name in ("fetch_url", "download_file", "find_pdf_pages"):
                 failed = str(result).lower().startswith(
