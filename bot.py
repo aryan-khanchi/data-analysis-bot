@@ -117,6 +117,9 @@ OFFICIAL_DOMAINS = (
     "indiabudget.gov.in", "education.gov.in", "epfindia.gov.in", "mha.gov.in",
     # International / multilateral - reliable for cross-checking Indian stats
     "worldbank.org", "imf.org", "ilo.org",
+    # UN agencies - useful specifically for health/gender/NFHS-adjacent
+    # questions that often get cross-referenced against MoSPI's own numbers
+    "who.int", "unicef.org", "undp.org",
     # Non-partisan Indian policy/research bodies - citation-grade summaries
     "prsindia.org", "epw.in", "ideasforindia.in",
     # A small set of reputable Indian business/economics dailies, for
@@ -125,9 +128,18 @@ OFFICIAL_DOMAINS = (
     "livemint.com", "business-standard.com", "thehindu.com", "indianexpress.com",
 )
 
+# .gov.in and .nic.in are centrally allocated by India's National Informatics
+# Centre - unlike .com/.org/.in generally, a random person or company cannot
+# register one. So trusting the whole namespace is safe in a way trusting all
+# of ".in" would not be, and it covers any genuine ministry/agency site we
+# haven't thought to enumerate above (health, elections, roads, ...) without
+# needing to grow OFFICIAL_DOMAINS by hand every time a new dataset comes up.
+TRUSTED_GOV_SUFFIXES = (".gov.in", ".nic.in")
+
 
 def _is_trusted_domain(url: str) -> bool:
-    """True if `url` is on (or a subdomain of) our curated allow-list. Search
+    """True if `url` is on (or a subdomain of) our curated allow-list, OR is
+    any genuine Indian government site (see TRUSTED_GOV_SUFFIXES). Search
     results are filtered down to this BEFORE they're ever shown to the agent -
     junk from random blogs/forums/aggregators never gets a chance to be read
     as fact, and we don't waste a turn on the agent noticing it's garbage."""
@@ -136,7 +148,9 @@ def _is_trusted_domain(url: str) -> bool:
     except Exception:
         return False
     host = host.split("@")[-1].split(":")[0]  # strip userinfo/port, defensive
-    return any(host == d or host.endswith("." + d) for d in OFFICIAL_DOMAINS)
+    if any(host == d or host.endswith("." + d) for d in OFFICIAL_DOMAINS):
+        return True
+    return any(host == s.lstrip(".") or host.endswith(s) for s in TRUSTED_GOV_SUFFIXES)
 
 
 def _extract_candidate_urls(text: str) -> list[str]:
