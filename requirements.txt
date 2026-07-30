@@ -11,3 +11,4 @@ pypdf>=5.0
 ddgs>=6.0
 python-dotenv>=1.0
 pymupdf
+fastmcp
